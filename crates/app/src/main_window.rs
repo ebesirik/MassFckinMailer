@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
@@ -132,6 +132,16 @@ enum PendingAction {
     New,
     OpenDialog,
     OpenPath(PathBuf),
+}
+
+/// Active resume mode: only re-run the (non-`sent`) rows from a loaded outcome
+/// report, matched to the current recipient list by original row index.
+struct ResumeInfo {
+    /// Original row indices to retry.
+    indices: HashSet<usize>,
+    failed: usize,
+    skipped: usize,
+    source: String,
 }
 
 // ---- Account form (M1) --------------------------------------------------
@@ -309,6 +319,8 @@ pub struct MainWindow {
     progress: Option<CampaignProgress>,
     summary: Option<CampaignSummary>,
     send_notice: Option<Notice>,
+    /// M7 — when set, only re-run these report rows.
+    resume: Option<ResumeInfo>,
 
     // M5 — project files
     project_path: Option<PathBuf>,
@@ -365,11 +377,41 @@ impl MainWindow {
             progress: None,
             summary: None,
             send_notice: None,
+            resume: None,
             project_path: None,
             project_name: "Untitled campaign".into(),
             saved_snapshot: ProjectSnapshot::fresh(),
             recents: RecentProjects::load(),
             project_notice: None,
+        }
+    }
+
+    /// Whether the template has any content worth sending.
+    fn has_template(&self, cx: &App) -> bool {
+        !self.template.subject.read(cx).value().trim().is_empty()
+            || !self.template.body.read(cx).value().trim().is_empty()
+    }
+
+    /// All prerequisites are met to start a campaign.
+    fn is_ready_to_send(&self, cx: &App) -> bool {
+        !self.store.accounts.is_empty() && self.has_template(cx) && self.sendable_count() > 0
+    }
+
+    /// Completion glyph for a nav step: green check when done, amber alert when
+    /// the step needs attention, or nothing when not yet started.
+    fn step_status(&self, section: Section, cx: &App) -> Option<(IconName, Hsla)> {
+        let done = (IconName::CircleCheck, cx.theme().success);
+        let attention = (IconName::TriangleAlert, cx.theme().warning);
+        match section {
+            Section::Accounts => (!self.store.accounts.is_empty()).then_some(done),
+            Section::Template => self.has_template(cx).then_some(done),
+            Section::Recipients => match &self.recipients {
+                RecipientsState::Loaded(l) => {
+                    Some(if l.report.valid > 0 { done } else { attention })
+                }
+                _ => None,
+            },
+            Section::Send => self.is_ready_to_send(cx).then_some(done),
         }
     }
 
@@ -874,13 +916,18 @@ impl MainWindow {
             .child(
                 SidebarGroup::new("Steps").child(SidebarMenu::new().children(
                     Section::ALL.map(|section| {
-                        SidebarMenuItem::new(section.label())
+                        let status = self.step_status(section, cx);
+                        let mut item = SidebarMenuItem::new(section.label())
                             .icon(section.icon())
                             .active(self.active == section)
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.active = section;
                                 cx.notify();
-                            }))
+                            }));
+                        if let Some((icon, color)) = status {
+                            item = item.suffix(div().text_color(color).child(Icon::new(icon)));
+                        }
+                        item
                     }),
                 )),
             )
@@ -940,11 +987,14 @@ impl MainWindow {
 
     fn render_account_list(&self, cx: &mut Context<Self>) -> impl IntoElement {
         if self.store.accounts.is_empty() {
-            return v_flex().child(
+            return v_flex().gap_2().child(
                 div()
                     .text_sm()
                     .text_color(cx.theme().muted_foreground)
-                    .child("No accounts yet. Add one below to start."),
+                    .child(
+                        "No accounts yet. Add one to begin — then write a template, import \
+                         recipients, and send. Secrets are kept in your OS keychain.",
+                    ),
             );
         }
 
@@ -1703,13 +1753,30 @@ impl MainWindow {
             .or_else(|| self.store.accounts.first().map(|a| a.id.clone()))
     }
 
-    /// Count of recipients that will actually be sent (valid rows, plus
-    /// duplicates when de-dupe is off).
+    /// Count of recipients that will actually be sent, respecting de-dupe and
+    /// any active resume filter.
     fn sendable_count(&self) -> usize {
         match &self.recipients {
-            RecipientsState::Loaded(l) => l.sendable(),
+            RecipientsState::Loaded(l) => self.selected_indices(l).len(),
             _ => 0,
         }
+    }
+
+    /// Row indices that will be sent: valid rows (plus duplicates when de-dupe
+    /// is off), further restricted to the resume set when resuming.
+    fn selected_indices(&self, loaded: &Loaded) -> Vec<usize> {
+        loaded
+            .report
+            .statuses
+            .iter()
+            .enumerate()
+            .filter_map(|(i, status)| {
+                let base = matches!(status, RowStatus::Ok)
+                    || (matches!(status, RowStatus::Duplicate) && !loaded.dedupe);
+                let resume_ok = self.resume.as_ref().is_none_or(|r| r.indices.contains(&i));
+                (base && resume_ok).then_some(i)
+            })
+            .collect()
     }
 
     /// Assemble a [`CampaignPlan`] from the current account, template, and the
@@ -1733,25 +1800,24 @@ impl MainWindow {
         };
 
         let email_col = loaded.email_col;
-        let mut recipients = Vec::new();
-        for (i, status) in loaded.report.statuses.iter().enumerate() {
-            let include = match status {
-                RowStatus::Ok => true,
-                RowStatus::Duplicate => !loaded.dedupe,
-                _ => false,
-            };
-            if !include {
-                continue;
-            }
-            let row = &loaded.table.rows[i];
-            recipients.push(CampaignRecipient {
-                index: i,
-                email: row.get(email_col).cloned().unwrap_or_default(),
-                context: mapping::build_context(&loaded.table, row, &loaded.mapping),
-            });
-        }
+        let recipients: Vec<CampaignRecipient> = self
+            .selected_indices(loaded)
+            .into_iter()
+            .map(|i| {
+                let row = &loaded.table.rows[i];
+                CampaignRecipient {
+                    index: i,
+                    email: row.get(email_col).cloned().unwrap_or_default(),
+                    context: mapping::build_context(&loaded.table, row, &loaded.mapping),
+                }
+            })
+            .collect();
         if recipients.is_empty() {
-            return Err("No valid recipients to send to.".into());
+            return Err(if self.resume.is_some() {
+                "No matching failed/cancelled rows to resume.".into()
+            } else {
+                "No valid recipients to send to.".into()
+            });
         }
 
         let subject = self.template.subject.read(cx).value().to_string();
@@ -1819,6 +1885,89 @@ impl MainWindow {
             }
         })
         .detach();
+    }
+
+    fn on_load_resume_report(&mut self, cx: &mut Context<Self>) {
+        let paths = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Open outcome report to resume".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            let selected = match paths.await {
+                Ok(Ok(Some(paths))) => paths.into_iter().next(),
+                _ => None,
+            };
+            let Some(path) = selected else { return };
+            let parse_path = path.clone();
+            let parsed = cx
+                .background_executor()
+                .spawn(async move { mmm_engine::load_report(&parse_path) })
+                .await;
+            let _ = this.update(cx, |this, cx| this.on_resume_report_loaded(path, parsed, cx));
+        })
+        .detach();
+    }
+
+    fn on_resume_report_loaded(
+        &mut self,
+        path: PathBuf,
+        parsed: Result<Vec<RowOutcome>, String>,
+        cx: &mut Context<Self>,
+    ) {
+        match parsed {
+            Err(e) => {
+                self.send_notice = Some(Notice {
+                    ok: false,
+                    text: format!("Could not read report: {e}"),
+                });
+            }
+            Ok(rows) => {
+                let mut indices = HashSet::new();
+                let (mut failed, mut skipped) = (0usize, 0usize);
+                for row in &rows {
+                    match row.status {
+                        OutcomeStatus::Sent => {}
+                        OutcomeStatus::Failed => {
+                            failed += 1;
+                            indices.insert(row.index);
+                        }
+                        OutcomeStatus::Skipped => {
+                            skipped += 1;
+                            indices.insert(row.index);
+                        }
+                    }
+                }
+                if indices.is_empty() {
+                    self.resume = None;
+                    self.send_notice = Some(Notice {
+                        ok: true,
+                        text: "That report has no failed or cancelled rows — nothing to resume."
+                            .into(),
+                    });
+                } else {
+                    let source = path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("report")
+                        .to_string();
+                    self.resume = Some(ResumeInfo {
+                        indices,
+                        failed,
+                        skipped,
+                        source,
+                    });
+                    self.send_notice = None;
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    fn clear_resume(&mut self, cx: &mut Context<Self>) {
+        self.resume = None;
+        cx.notify();
     }
 
     // ---- Send UI --------------------------------------------------------
@@ -1895,10 +2044,17 @@ impl MainWindow {
 
         let can_send = !self.store.accounts.is_empty() && sendable > 0;
 
+        let send_label = if self.resume.is_some() {
+            format!("Resume {sendable} emails")
+        } else {
+            format!("Send {sendable} emails")
+        };
+
         v_flex()
             .gap_4()
             .max_w(px(620.))
             .child(self.render_account_picker(cx))
+            .child(self.render_resume_control(cx))
             .child(
                 v_flex()
                     .gap_2()
@@ -1941,10 +2097,45 @@ impl MainWindow {
                 Button::new("send-campaign")
                     .primary()
                     .icon(IconName::ArrowRight)
-                    .label(format!("Send {sendable} emails"))
+                    .label(send_label)
                     .disabled(!can_send)
                     .on_click(cx.listener(|this, _, _, cx| this.on_send(cx))),
             )
+    }
+
+    fn render_resume_control(&self, cx: &mut Context<Self>) -> AnyElement {
+        match &self.resume {
+            Some(r) => h_flex()
+                .items_center()
+                .justify_between()
+                .gap_3()
+                .p_3()
+                .rounded(cx.theme().radius)
+                .border_1()
+                .border_color(cx.theme().border)
+                .bg(cx.theme().secondary)
+                .child(
+                    div().text_sm().child(format!(
+                        "Resuming from {} — {} failed, {} cancelled",
+                        r.source, r.failed, r.skipped
+                    )),
+                )
+                .child(
+                    Button::new("clear-resume")
+                        .ghost()
+                        .label("Clear")
+                        .on_click(cx.listener(|this, _, _, cx| this.clear_resume(cx))),
+                )
+                .into_any_element(),
+            None => h_flex()
+                .child(
+                    Button::new("resume-report")
+                        .ghost()
+                        .label("Resume from outcome report…")
+                        .on_click(cx.listener(|this, _, _, cx| this.on_load_resume_report(cx))),
+                )
+                .into_any_element(),
+        }
     }
 
     fn render_progress(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -2196,6 +2387,7 @@ impl MainWindow {
         self.progress = None;
         self.summary = None;
         self.send_notice = None;
+        self.resume = None;
         self.project_path = None;
         self.project_name = "Untitled campaign".into();
         self.project_notice = None;
@@ -2253,6 +2445,7 @@ impl MainWindow {
         self.progress = None;
         self.summary = None;
         self.send_notice = None;
+        self.resume = None;
         self.project_notice = Some(Notice {
             ok: true,
             text: format!("Opened {}", path.display()),

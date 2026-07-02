@@ -688,6 +688,38 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// Parse an outcome report CSV previously written by [`export_csv`]. Used to
+/// resume a campaign by re-running its non-`sent` rows (M7).
+pub fn load_report(path: &std::path::Path) -> Result<Vec<RowOutcome>, String> {
+    let mut reader = csv::Reader::from_path(path).map_err(|e| e.to_string())?;
+    let mut rows = Vec::new();
+    for record in reader.records() {
+        let record = record.map_err(|e| e.to_string())?;
+        let index: usize = record
+            .get(0)
+            .and_then(|s| s.trim().parse().ok())
+            .ok_or_else(|| "outcome report: missing/invalid row index".to_string())?;
+        let email = record.get(1).unwrap_or_default().to_string();
+        let status = match record.get(2).unwrap_or_default().trim() {
+            "sent" => OutcomeStatus::Sent,
+            "failed" => OutcomeStatus::Failed,
+            _ => OutcomeStatus::Skipped,
+        };
+        let error = record.get(3).filter(|s| !s.is_empty()).map(String::from);
+        let provider_message_id = record.get(4).filter(|s| !s.is_empty()).map(String::from);
+        let timestamp_ms = record.get(5).and_then(|s| s.trim().parse().ok()).unwrap_or(0);
+        rows.push(RowOutcome {
+            index,
+            email,
+            status,
+            error,
+            provider_message_id,
+            timestamp_ms,
+        });
+    }
+    Ok(rows)
+}
+
 fn export_csv(report: &Arc<Mutex<Vec<RowOutcome>>>, path: &std::path::Path) -> Result<usize, String> {
     let rows = report.lock().unwrap().clone();
     let mut writer = csv::Writer::from_path(path).map_err(|e| e.to_string())?;
@@ -933,11 +965,20 @@ mod tests {
         assert_eq!(count, 2);
 
         let text = std::fs::read_to_string(&path).unwrap();
-        let _ = std::fs::remove_file(&path);
         assert!(text.starts_with("row,email,status,error,provider_message_id,timestamp_ms\n"));
         assert!(text.contains("0,a@x.com,sent,,id-1,111"));
         // The comma/quote in the error is CSV-escaped by the writer.
         assert!(text.contains("\"bad, comma \"\"quoted\"\"\""));
+
+        // Round-trips back through the resume parser.
+        let loaded = load_report(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].index, 0);
+        assert_eq!(loaded[0].status, OutcomeStatus::Sent);
+        assert_eq!(loaded[0].provider_message_id.as_deref(), Some("id-1"));
+        assert_eq!(loaded[1].status, OutcomeStatus::Failed);
+        assert_eq!(loaded[1].error.as_deref(), Some("bad, comma \"quoted\""));
     }
 
     #[tokio::test]

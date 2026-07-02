@@ -8,6 +8,15 @@ license.workspace = true
 name = "massfckinmailer"
 path = "src/main.rs"
 
+# Installer/bundle metadata (used by `cargo bundle` / `cargo wix`).
+[package.metadata.bundle]
+name = "MassFckinMailer"
+identifier = "com.massfckinmailer.app"
+icon = ["../../assets/icon.png", "../../assets/icon.ico"]
+short_description = "Cross-platform desktop mass mailer."
+long_description = "Send templated bulk email through SMTP, Mailgun, AWS SES, Gmail, or Outlook, with recipient import, live preview, throttling, and per-row outcome reports."
+category = "public.app-category.productivity"
+
 [dependencies]
 anyhow.workspace = true
 gpui.workspace = true
@@ -16,3 +25,11 @@ gpui-component-assets.workspace = true
 mmm-core.workspace = true
 mmm-engine.workspace = true
 mmm-providers.workspace = true
+
+[dev-dependencies]
+# Used only by `examples/gen_icon.rs` to render assets/icon.{png,ico}.
+image = { version = "0.25", default-features = false, features = ["png", "ico"] }
+
+[target.'cfg(windows)'.build-dependencies]
+# Embeds assets/icon.ico into the .exe so Explorer/taskbar show the app icon.
+winresource = "0.1"
