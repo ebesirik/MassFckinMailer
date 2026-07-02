@@ -4257,6 +4257,7 @@ dependencies = [
  "mmm-core",
  "mmm-engine",
  "mmm-providers",
+ "rust-i18n",
  "winresource",
 ]
 

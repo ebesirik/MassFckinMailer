@@ -13,13 +13,31 @@ use gpui_component::{
     text::TextView,
     v_flex,
 };
-use mmm_core::import::{self, RecipientTable, SourceKind};
+use mmm_core::import::{self, RecipientTable, SourceKind, is_email};
 use mmm_core::mapping::{self, RowStatus, ValidationReport};
 use mmm_core::project::{
     AccountRef, CURRENT_VERSION, PROJECT_SUFFIX, Project, RecentProjects, RecipientSource,
     SendingConfig, TemplateSpec,
 };
+use mmm_core::settings::AppSettings;
 use mmm_core::template::{self, extract_placeholders, normalize_placeholders};
+use rust_i18n::t;
+
+/// Selectable UI languages: (locale code, short label for the picker).
+const LANGUAGES: &[(&str, &str)] = &[
+    ("en", "EN"),
+    ("tr", "TR"),
+    ("es", "ES"),
+    ("de", "DE"),
+    ("fr", "FR"),
+    ("it", "IT"),
+    ("pt", "PT"),
+];
+
+/// Translate a key with the current locale (no interpolation).
+fn tr(key: &str) -> String {
+    t!(key).into_owned()
+}
 use mmm_engine::{
     CampaignPlan, CampaignProgress, CampaignRecipient, CampaignState, CampaignSummary, Command,
     Event, MailRuntime, OutcomeStatus, RowOutcome,
@@ -45,12 +63,12 @@ impl Section {
         Section::Send,
     ];
 
-    fn label(&self) -> &'static str {
+    fn label_key(&self) -> &'static str {
         match self {
-            Self::Accounts => "Accounts",
-            Self::Template => "Template",
-            Self::Recipients => "Recipients",
-            Self::Send => "Send",
+            Self::Accounts => "nav.accounts",
+            Self::Template => "nav.template",
+            Self::Recipients => "nav.recipients",
+            Self::Send => "nav.send",
         }
     }
 
@@ -63,24 +81,12 @@ impl Section {
         }
     }
 
-    fn hint(&self) -> &'static str {
+    fn hint_key(&self) -> &'static str {
         match self {
-            Self::Accounts => {
-                "Add a sending account first — SMTP, Mailgun, AWS SES, or Gmail/Outlook. \
-                 Secrets are stored in your OS keychain, never in project files."
-            }
-            Self::Template => {
-                "Write your email with placeholders like {{first_name}} (##first_name## works too). \
-                 The subject line is a template as well."
-            }
-            Self::Recipients => {
-                "Drop a CSV or Excel file. The email column is detected automatically, \
-                 and you map the remaining columns to template fields."
-            }
-            Self::Send => {
-                "Review the pre-flight summary, then send. You can cancel at any time — \
-                 emails already delivered stay delivered."
-            }
+            Self::Accounts => "hint.accounts",
+            Self::Template => "hint.template",
+            Self::Recipients => "hint.recipients",
+            Self::Send => "hint.send",
         }
     }
 }
@@ -109,6 +115,7 @@ struct ProjectSnapshot {
     email_column: Option<String>,
     mapping: BTreeMap<String, String>,
     dedupe: bool,
+    sending: SendingConfig,
 }
 
 impl ProjectSnapshot {
@@ -123,6 +130,7 @@ impl ProjectSnapshot {
             email_column: None,
             mapping: BTreeMap::new(),
             dedupe: true,
+            sending: SendingConfig::default(),
         }
     }
 }
@@ -321,6 +329,11 @@ pub struct MainWindow {
     send_notice: Option<Notice>,
     /// M7 — when set, only re-run these report rows.
     resume: Option<ResumeInfo>,
+    // Sending settings (persisted per project) + test-send address.
+    send_mps: Entity<InputState>,
+    send_retry: Entity<InputState>,
+    send_stop: Entity<InputState>,
+    test_email: Entity<InputState>,
 
     // M5 — project files
     project_path: Option<PathBuf>,
@@ -328,6 +341,9 @@ pub struct MainWindow {
     saved_snapshot: ProjectSnapshot,
     recents: RecentProjects,
     project_notice: Option<Notice>,
+
+    /// Current UI language code (mirrors the global rust-i18n locale).
+    language: String,
 }
 
 fn read_trimmed(input: &Entity<InputState>, cx: &App) -> String {
@@ -361,6 +377,15 @@ impl MainWindow {
         let form = AccountForm::new(window, cx);
         let template = TemplateForm::new(window, cx);
 
+        let sc = SendingConfig::default();
+        let send_mps =
+            cx.new(|cx| InputState::new(window, cx).default_value(sc.messages_per_second.to_string()));
+        let send_retry =
+            cx.new(|cx| InputState::new(window, cx).default_value(sc.retry_limit.to_string()));
+        let send_stop =
+            cx.new(|cx| InputState::new(window, cx).default_value(sc.stop_after_failures.to_string()));
+        let test_email = cx.new(|cx| InputState::new(window, cx).placeholder("you@example.com"));
+
         Self {
             active: Section::Accounts,
             mail,
@@ -378,12 +403,27 @@ impl MainWindow {
             summary: None,
             send_notice: None,
             resume: None,
+            send_mps,
+            send_retry,
+            send_stop,
+            test_email,
             project_path: None,
-            project_name: "Untitled campaign".into(),
+            project_name: tr("proj.untitled"),
             saved_snapshot: ProjectSnapshot::fresh(),
             recents: RecentProjects::load(),
             project_notice: None,
+            language: AppSettings::load().language,
         }
+    }
+
+    fn on_set_language(&mut self, code: &str, cx: &mut Context<Self>) {
+        self.language = code.to_string();
+        rust_i18n::set_locale(code);
+        let _ = AppSettings {
+            language: code.to_string(),
+        }
+        .save();
+        cx.notify();
     }
 
     /// Whether the template has any content worth sending.
@@ -419,7 +459,9 @@ impl MainWindow {
         match event {
             Event::TestResult { ok, message, .. } => {
                 self.testing = false;
-                self.notice = Some(Notice { ok, text: message });
+                // Success is localized; failures keep the provider's detail.
+                let text = if ok { tr("acct.test_ok") } else { message };
+                self.notice = Some(Notice { ok, text });
             }
             Event::OAuthConnected {
                 account_id,
@@ -441,7 +483,11 @@ impl MainWindow {
                         }
                         self.form.open = false;
                     }
-                    self.notice = Some(Notice { ok: true, text: message });
+                    let _ = message;
+                    self.notice = Some(Notice {
+                        ok: true,
+                        text: tr("acct.connect_ok"),
+                    });
                 } else {
                     self.pending_oauth = None;
                     self.notice = Some(Notice { ok: false, text: message });
@@ -474,16 +520,14 @@ impl MainWindow {
                 let password = self.form.smtp_password.read(cx).value().to_string();
 
                 if host.is_empty() {
-                    return Err("SMTP host is required.".into());
+                    return Err(tr("err.smtp_host"));
                 }
-                let port: u16 = port
-                    .parse()
-                    .map_err(|_| "Port must be a number between 1 and 65535.".to_string())?;
+                let port: u16 = port.parse().map_err(|_| tr("err.port"))?;
                 if from.is_empty() {
-                    return Err("A From address is required.".into());
+                    return Err(tr("err.from"));
                 }
                 if password.is_empty() {
-                    return Err("A password is required.".into());
+                    return Err(tr("err.password"));
                 }
                 if display.is_empty() {
                     display = format!("SMTP — {host}");
@@ -510,13 +554,13 @@ impl MainWindow {
                 let api_key = self.form.mg_api_key.read(cx).value().to_string();
 
                 if domain.is_empty() {
-                    return Err("Mailgun sending domain is required.".into());
+                    return Err(tr("err.mg_domain"));
                 }
                 if from.is_empty() {
-                    return Err("A From address is required.".into());
+                    return Err(tr("err.from"));
                 }
                 if api_key.is_empty() {
-                    return Err("A Mailgun API key is required.".into());
+                    return Err(tr("err.mg_api_key"));
                 }
                 if display.is_empty() {
                     display = format!("Mailgun — {domain}");
@@ -542,13 +586,13 @@ impl MainWindow {
                 let secret = self.form.ses_secret.read(cx).value().trim().to_string();
 
                 if region.is_empty() {
-                    return Err("AWS region is required.".into());
+                    return Err(tr("err.region"));
                 }
                 if from.is_empty() {
-                    return Err("A verified From address is required.".into());
+                    return Err(tr("err.ses_from"));
                 }
                 if key_id.is_empty() || secret.is_empty() {
-                    return Err("Both the access key id and secret access key are required.".into());
+                    return Err(tr("err.ses_creds"));
                 }
                 if display.is_empty() {
                     display = format!("SES — {region}");
@@ -569,10 +613,10 @@ impl MainWindow {
                 let client_secret = self.form.oauth_client_secret.read(cx).value().trim().to_string();
                 let from = read_trimmed(&self.form.oauth_from, cx);
                 if client_id.is_empty() {
-                    return Err("OAuth client ID is required.".into());
+                    return Err(tr("err.client_id"));
                 }
                 if from.is_empty() {
-                    return Err("Your Gmail address (From) is required.".into());
+                    return Err(tr("err.gmail_from"));
                 }
                 if display.is_empty() {
                     display = format!("Gmail — {from}");
@@ -593,10 +637,10 @@ impl MainWindow {
                 let tenant = read_trimmed(&self.form.oauth_tenant, cx);
                 let from = read_trimmed(&self.form.oauth_from, cx);
                 if client_id.is_empty() {
-                    return Err("Application (client) ID is required.".into());
+                    return Err(tr("err.app_client_id"));
                 }
                 if from.is_empty() {
-                    return Err("Your address (From) is required.".into());
+                    return Err(tr("err.oauth_from"));
                 }
                 if display.is_empty() {
                     display = format!("Outlook — {from}");
@@ -625,7 +669,7 @@ impl MainWindow {
                 self.testing = true;
                 self.notice = Some(Notice {
                     ok: true,
-                    text: "Testing connection…".into(),
+                    text: tr("acct.testing"),
                 });
                 self.mail.command(Command::TestAccount { account, secret });
             }
@@ -641,7 +685,7 @@ impl MainWindow {
                 self.testing = true;
                 self.notice = Some(Notice {
                     ok: true,
-                    text: "Opening your browser to authorize… complete sign-in there.".into(),
+                    text: tr("acct.connecting"),
                 });
                 self.mail
                     .command(Command::ConnectOAuth { account, client_secret });
@@ -658,7 +702,7 @@ impl MainWindow {
                 if let Err(e) = secrets::set(&account.id, &secret) {
                     self.notice = Some(Notice {
                         ok: false,
-                        text: format!("Could not store secret in keychain: {e}"),
+                        text: format!("{}: {e}", tr("acct.keychain_error")),
                     });
                     cx.notify();
                     return;
@@ -667,7 +711,7 @@ impl MainWindow {
                 if let Err(e) = self.store.save() {
                     self.notice = Some(Notice {
                         ok: false,
-                        text: format!("Account saved to keychain but writing accounts file failed: {e}"),
+                        text: format!("{}: {e}", tr("acct.file_error")),
                     });
                     cx.notify();
                     return;
@@ -675,7 +719,7 @@ impl MainWindow {
                 self.form.open = false;
                 self.notice = Some(Notice {
                     ok: true,
-                    text: "Account saved.".into(),
+                    text: tr("acct.saved"),
                 });
             }
             Err(text) => self.notice = Some(Notice { ok: false, text }),
@@ -714,7 +758,7 @@ impl MainWindow {
             files: true,
             directories: false,
             multiple: false,
-            prompt: Some("Choose recipient list".into()),
+            prompt: Some(tr("rcpt.file_prompt").into()),
         });
         cx.spawn(async move |this, cx| {
             let selected = match paths.await {
@@ -910,14 +954,14 @@ impl MainWindow {
                             .flex_1()
                             .overflow_hidden()
                             .child("MassFckinMailer")
-                            .child(div().text_xs().child("Campaign setup")),
+                            .child(div().text_xs().child(tr("nav.subtitle"))),
                     ),
             )
             .child(
                 SidebarGroup::new("Steps").child(SidebarMenu::new().children(
                     Section::ALL.map(|section| {
                         let status = self.step_status(section, cx);
-                        let mut item = SidebarMenuItem::new(section.label())
+                        let mut item = SidebarMenuItem::new(tr(section.label_key()))
                             .icon(section.icon())
                             .active(self.active == section)
                             .on_click(cx.listener(move |this, _, _, cx| {
@@ -939,12 +983,12 @@ impl MainWindow {
             .flex_1()
             .gap_4()
             .p_8()
-            .child(div().text_xl().child(section.label()))
+            .child(div().text_xl().child(tr(section.label_key())))
             .child(
                 div()
                     .text_color(cx.theme().muted_foreground)
                     .max_w(px(620.))
-                    .child(section.hint()),
+                    .child(tr(section.hint_key())),
             )
             .when(section == Section::Accounts, |this| {
                 this.child(self.render_accounts(cx))
@@ -973,7 +1017,7 @@ impl MainWindow {
                         Button::new("add-account")
                             .primary()
                             .icon(IconName::Plus)
-                            .label("Add account")
+                            .label(tr("acct.add"))
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.form.open = true;
                                 this.notice = None;
@@ -991,10 +1035,7 @@ impl MainWindow {
                 div()
                     .text_sm()
                     .text_color(cx.theme().muted_foreground)
-                    .child(
-                        "No accounts yet. Add one to begin — then write a template, import \
-                         recipients, and send. Secrets are kept in your OS keychain.",
-                    ),
+                    .child(tr("acct.empty")),
             );
         }
 
@@ -1030,7 +1071,7 @@ impl MainWindow {
                     Button::new(SharedString::from(format!("del-{id}")))
                         .ghost()
                         .icon(IconName::Delete)
-                        .tooltip("Remove account")
+                        .tooltip(tr("acct.remove"))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.on_delete_account(id.clone(), cx);
                         })),
@@ -1051,23 +1092,23 @@ impl MainWindow {
             .border_1()
             .border_color(cx.theme().border)
             .bg(cx.theme().secondary)
-            .child(div().text_sm().child("New account"))
+            .child(div().text_sm().child(tr("acct.new")))
             .child(
                 v_flex()
                     .gap_1()
-                    .child(field_label("Provider", cx))
+                    .child(field_label("acct.provider", cx))
                     .child(
                         h_flex()
                             .gap_2()
                             .flex_wrap()
-                            .child(kind_button("k-smtp", "Generic SMTP", ProviderKind::Smtp, kind, cx))
-                            .child(kind_button("k-mailgun", "Mailgun", ProviderKind::Mailgun, kind, cx))
-                            .child(kind_button("k-ses", "AWS SES", ProviderKind::Ses, kind, cx))
-                            .child(kind_button("k-gmail", "Gmail", ProviderKind::Gmail, kind, cx))
-                            .child(kind_button("k-outlook", "Outlook", ProviderKind::Outlook, kind, cx)),
+                            .child(kind_button("k-smtp", "provider.smtp", ProviderKind::Smtp, kind, cx))
+                            .child(kind_button("k-mailgun", "provider.mailgun", ProviderKind::Mailgun, kind, cx))
+                            .child(kind_button("k-ses", "provider.ses", ProviderKind::Ses, kind, cx))
+                            .child(kind_button("k-gmail", "provider.gmail", ProviderKind::Gmail, kind, cx))
+                            .child(kind_button("k-outlook", "provider.outlook", ProviderKind::Outlook, kind, cx)),
                     ),
             )
-            .child(labeled("Display name (optional)", &self.form.display, cx))
+            .child(labeled("acct.display", &self.form.display, cx))
             .when(kind == ProviderKind::Smtp, |this| {
                 this.child(self.render_smtp_fields(cx))
             })
@@ -1098,14 +1139,14 @@ impl MainWindow {
                         this.child(
                             Button::new("test-conn")
                                 .outline()
-                                .label("Test connection")
+                                .label(tr("acct.test"))
                                 .disabled(self.testing)
                                 .on_click(cx.listener(|this, _, _, cx| this.on_test_connection(cx))),
                         )
                         .child(
                             Button::new("save-account")
                                 .primary()
-                                .label("Save account")
+                                .label(tr("acct.save"))
                                 .disabled(self.testing)
                                 .on_click(cx.listener(|this, _, _, cx| this.on_save_account(cx))),
                         )
@@ -1114,7 +1155,7 @@ impl MainWindow {
                         this.child(
                             Button::new("connect-oauth")
                                 .primary()
-                                .label("Connect & authorize")
+                                .label(tr("acct.connect"))
                                 .disabled(self.testing)
                                 .on_click(cx.listener(|this, _, _, cx| this.on_connect_oauth(cx))),
                         )
@@ -1122,7 +1163,7 @@ impl MainWindow {
                     .child(
                         Button::new("cancel-account")
                             .ghost()
-                            .label("Cancel")
+                            .label(tr("common.cancel"))
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.form.open = false;
                                 this.notice = None;
@@ -1140,48 +1181,48 @@ impl MainWindow {
             .child(
                 h_flex()
                     .gap_3()
-                    .child(div().flex_1().child(labeled("Host", &self.form.smtp_host, cx)))
+                    .child(div().flex_1().child(labeled("acct.host", &self.form.smtp_host, cx)))
                     .child(
                         div()
                             .w(px(120.))
-                            .child(labeled("Port", &self.form.smtp_port, cx)),
+                            .child(labeled("acct.port", &self.form.smtp_port, cx)),
                     ),
             )
             .child(
                 v_flex()
                     .gap_1()
-                    .child(field_label("Encryption", cx))
+                    .child(field_label("acct.encryption", cx))
                     .child(
                         h_flex()
                             .gap_2()
-                            .child(tls_button("tls-starttls", "STARTTLS", TlsMode::StartTls, tls, cx))
-                            .child(tls_button("tls-tls", "SSL/TLS", TlsMode::Tls, tls, cx))
-                            .child(tls_button("tls-none", "None", TlsMode::None, tls, cx)),
+                            .child(tls_button("tls-starttls", "tls.starttls", TlsMode::StartTls, tls, cx))
+                            .child(tls_button("tls-tls", "tls.tls", TlsMode::Tls, tls, cx))
+                            .child(tls_button("tls-none", "tls.none", TlsMode::None, tls, cx)),
                     ),
             )
-            .child(labeled("Username", &self.form.smtp_username, cx))
-            .child(labeled("From address", &self.form.smtp_from, cx))
-            .child(labeled("Password", &self.form.smtp_password, cx))
+            .child(labeled("acct.username", &self.form.smtp_username, cx))
+            .child(labeled("acct.from", &self.form.smtp_from, cx))
+            .child(labeled("acct.password", &self.form.smtp_password, cx))
     }
 
     fn render_mailgun_fields(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let region = self.form.region;
         v_flex()
             .gap_3()
-            .child(labeled("Sending domain", &self.form.mg_domain, cx))
+            .child(labeled("acct.mg_domain", &self.form.mg_domain, cx))
             .child(
                 v_flex()
                     .gap_1()
-                    .child(field_label("Region", cx))
+                    .child(field_label("acct.region", cx))
                     .child(
                         h_flex()
                             .gap_2()
-                            .child(region_button("rg-us", "US", MailgunRegion::Us, region, cx))
-                            .child(region_button("rg-eu", "EU", MailgunRegion::Eu, region, cx)),
+                            .child(region_button("rg-us", "region.us", MailgunRegion::Us, region, cx))
+                            .child(region_button("rg-eu", "region.eu", MailgunRegion::Eu, region, cx)),
                     ),
             )
-            .child(labeled("From address", &self.form.mg_from, cx))
-            .child(labeled("API key", &self.form.mg_api_key, cx))
+            .child(labeled("acct.from", &self.form.mg_from, cx))
+            .child(labeled("acct.api_key", &self.form.mg_api_key, cx))
     }
 
     fn render_ses_fields(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1193,56 +1234,45 @@ impl MainWindow {
                     .child(
                         div()
                             .w(px(160.))
-                            .child(labeled("Region", &self.form.ses_region, cx)),
+                            .child(labeled("acct.region", &self.form.ses_region, cx)),
                     )
-                    .child(div().flex_1().child(labeled("From address", &self.form.ses_from, cx))),
+                    .child(div().flex_1().child(labeled("acct.from", &self.form.ses_from, cx))),
             )
-            .child(labeled("Access key id", &self.form.ses_key_id, cx))
-            .child(labeled("Secret access key", &self.form.ses_secret, cx))
+            .child(labeled("acct.ses_key_id", &self.form.ses_key_id, cx))
+            .child(labeled("acct.ses_secret", &self.form.ses_secret, cx))
             .child(
                 div()
                     .text_xs()
                     .text_color(cx.theme().muted_foreground)
-                    .child(
-                        "The From address must be a verified SES identity. New accounts are in \
-                         the sandbox — recipients must also be verified until you request production access.",
-                    ),
+                    .child(tr("acct.ses_note")),
             )
     }
 
     fn render_gmail_fields(&self, cx: &mut Context<Self>) -> impl IntoElement {
         v_flex()
             .gap_3()
-            .child(labeled("From (your Gmail address)", &self.form.oauth_from, cx))
-            .child(labeled("OAuth client ID", &self.form.oauth_client_id, cx))
-            .child(labeled("Client secret", &self.form.oauth_client_secret, cx))
+            .child(labeled("acct.gmail_from", &self.form.oauth_from, cx))
+            .child(labeled("acct.client_id", &self.form.oauth_client_id, cx))
+            .child(labeled("acct.client_secret", &self.form.oauth_client_secret, cx))
             .child(
                 div()
                     .text_xs()
                     .text_color(cx.theme().muted_foreground)
-                    .child(
-                        "In Google Cloud: enable the Gmail API, create an OAuth client of type \
-                         \"Desktop app\", and paste its client ID + secret here. \"Connect\" opens \
-                         your browser to grant the gmail.send scope; personal Gmail caps at ~500/day.",
-                    ),
+                    .child(tr("acct.gmail_note")),
             )
     }
 
     fn render_outlook_fields(&self, cx: &mut Context<Self>) -> impl IntoElement {
         v_flex()
             .gap_3()
-            .child(labeled("From (your address)", &self.form.oauth_from, cx))
-            .child(labeled("Application (client) ID", &self.form.oauth_client_id, cx))
-            .child(labeled("Tenant (common / organizations / id)", &self.form.oauth_tenant, cx))
+            .child(labeled("acct.oauth_from", &self.form.oauth_from, cx))
+            .child(labeled("acct.app_client_id", &self.form.oauth_client_id, cx))
+            .child(labeled("acct.tenant", &self.form.oauth_tenant, cx))
             .child(
                 div()
                     .text_xs()
                     .text_color(cx.theme().muted_foreground)
-                    .child(
-                        "In Azure: register an app, add the delegated Mail.Send permission, and \
-                         under \"Mobile and desktop applications\" add redirect URI http://localhost. \
-                         No client secret is needed (public client + PKCE). \"Connect\" opens your browser.",
-                    ),
+                    .child(tr("acct.outlook_note")),
             )
     }
 
@@ -1292,7 +1322,7 @@ impl MainWindow {
         v_flex()
             .gap_4()
             .size_full()
-            .child(labeled("Subject", &self.template.subject, cx))
+            .child(labeled("tmpl.subject", &self.template.subject, cx))
             .child(self.render_placeholder_chips(cx))
             .child(
                 h_flex()
@@ -1303,7 +1333,7 @@ impl MainWindow {
                         v_flex()
                             .gap_1()
                             .flex_1()
-                            .child(field_label("Body (HTML)", cx))
+                            .child(field_label("tmpl.body", cx))
                             .child(
                                 div()
                                     .h(px(440.))
@@ -1329,10 +1359,7 @@ impl MainWindow {
             return div()
                 .text_xs()
                 .text_color(cx.theme().muted_foreground)
-                .child(
-                    "Load a recipient list in the Recipients step to insert placeholder chips. \
-                     You can still type {{field}} manually.",
-                )
+                .child(tr("tmpl.chips_hint"))
                 .into_any_element();
         }
 
@@ -1340,7 +1367,7 @@ impl MainWindow {
             .gap_2()
             .flex_wrap()
             .items_center()
-            .child(field_label("Insert field", cx));
+            .child(field_label("tmpl.insert", cx));
         for (i, header) in headers.iter().enumerate() {
             let insert = format!("{{{{{}}}}}", template::to_placeholder_ident(header));
             row = row.child(
@@ -1364,12 +1391,12 @@ impl MainWindow {
             return h_flex()
                 .gap_2()
                 .items_center()
-                .child(field_label("Preview", cx))
+                .child(field_label("tmpl.preview", cx))
                 .child(
                     div()
                         .text_xs()
                         .text_color(cx.theme().muted_foreground)
-                        .child("(no data loaded — showing field names)"),
+                        .child(tr("tmpl.preview_nodata")),
                 )
                 .into_any_element();
         }
@@ -1377,11 +1404,11 @@ impl MainWindow {
         h_flex()
             .gap_2()
             .items_center()
-            .child(field_label("Preview", cx))
+            .child(field_label("tmpl.preview", cx))
             .child(
                 Button::new("prev-row")
                     .ghost()
-                    .label("‹ Prev")
+                    .label(tr("common.prev"))
                     .disabled(self.preview_row == 0)
                     .on_click(cx.listener(|this, _, _, cx| this.preview_prev(cx))),
             )
@@ -1389,12 +1416,12 @@ impl MainWindow {
                 div()
                     .text_xs()
                     .text_color(cx.theme().muted_foreground)
-                    .child(format!("Row {current} of {total}")),
+                    .child(t!("tmpl.row_of", current = current, total = total).to_string()),
             )
             .child(
                 Button::new("next-row")
                     .ghost()
-                    .label("Next ›")
+                    .label(tr("common.next"))
                     .disabled(self.preview_row + 1 >= total)
                     .on_click(cx.listener(|this, _, _, cx| this.preview_next(cx))),
             )
@@ -1419,7 +1446,7 @@ impl MainWindow {
             Err(e) => div()
                 .text_sm()
                 .text_color(cx.theme().danger)
-                .child(format!("Body error: {e}"))
+                .child(format!("{}: {e}", tr("tmpl.body_error")))
                 .into_any_element(),
         };
 
@@ -1436,7 +1463,7 @@ impl MainWindow {
                     .text_sm()
                     .text_color(cx.theme().muted_foreground)
                     .truncate()
-                    .child(format!("Subject: {subject}")),
+                    .child(t!("tmpl.subject_prefix", subject = subject).to_string()),
             )
             .child(body_el)
     }
@@ -1449,12 +1476,12 @@ impl MainWindow {
             RecipientsState::Loading => div()
                 .text_sm()
                 .text_color(cx.theme().muted_foreground)
-                .child("Parsing file…")
+                .child(tr("rcpt.parsing"))
                 .into_any_element(),
             RecipientsState::Error(message) => v_flex()
                 .gap_3()
                 .child(div().text_color(cx.theme().danger).child(message.clone()))
-                .child(self.choose_file_button("retry-file", "Choose another file", cx))
+                .child(self.choose_file_button("retry-file", "rcpt.choose_another", cx))
                 .into_any_element(),
             RecipientsState::Loaded(loaded) => self.render_loaded(loaded, cx).into_any_element(),
         }
@@ -1463,13 +1490,13 @@ impl MainWindow {
     fn choose_file_button(
         &self,
         id: &'static str,
-        label: &'static str,
+        label_key: &'static str,
         cx: &mut Context<Self>,
     ) -> Button {
         Button::new(id)
             .primary()
             .icon(IconName::Inbox)
-            .label(label)
+            .label(tr(label_key))
             .on_click(cx.listener(|this, _, _, cx| this.on_choose_file(cx)))
     }
 
@@ -1486,9 +1513,9 @@ impl MainWindow {
                 div()
                     .text_sm()
                     .text_color(cx.theme().muted_foreground)
-                    .child("Import a CSV or Excel (.xlsx/.xls/.ods) file of recipients."),
+                    .child(tr("rcpt.empty")),
             )
-            .child(self.choose_file_button("choose-file", "Choose CSV or Excel file", cx))
+            .child(self.choose_file_button("choose-file", "rcpt.choose", cx))
     }
 
     fn render_loaded(&self, loaded: &Loaded, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1498,12 +1525,13 @@ impl MainWindow {
             .and_then(|n| n.to_str())
             .unwrap_or("file")
             .to_string();
-        let summary = format!(
-            "{} · {} rows · {} columns",
-            file_name,
-            loaded.table.row_count(),
-            loaded.table.column_count()
-        );
+        let summary = t!(
+            "rcpt.summary",
+            file = file_name,
+            rows = loaded.table.row_count(),
+            cols = loaded.table.column_count()
+        )
+        .to_string();
 
         v_flex()
             .gap_4()
@@ -1513,7 +1541,7 @@ impl MainWindow {
                     .justify_between()
                     .gap_3()
                     .child(div().text_sm().child(summary))
-                    .child(self.choose_file_button("change-file", "Change file", cx)),
+                    .child(self.choose_file_button("change-file", "rcpt.change", cx)),
             )
             .when(loaded.sheets.len() > 1, |this| {
                 this.child(self.render_sheet_picker(loaded, cx))
@@ -1541,7 +1569,7 @@ impl MainWindow {
         }
         v_flex()
             .gap_1()
-            .child(field_label("Sheet", cx))
+            .child(field_label("rcpt.sheet", cx))
             .child(h_flex().gap_2().flex_wrap().children(chips))
     }
 
@@ -1558,7 +1586,7 @@ impl MainWindow {
         }
         v_flex()
             .gap_1()
-            .child(field_label("Email column", cx))
+            .child(field_label("rcpt.email_col", cx))
             .child(h_flex().gap_2().flex_wrap().children(chips))
     }
 
@@ -1566,26 +1594,23 @@ impl MainWindow {
         if loaded.fields.is_empty() {
             return v_flex()
                 .gap_2()
-                .child(field_label("Field mapping", cx))
+                .child(field_label("rcpt.mapping", cx))
                 .child(
                     div()
                         .text_sm()
                         .text_color(cx.theme().muted_foreground)
-                        .child(
-                            "No template fields yet. Add placeholders like {{first_name}} in the \
-                             Template step, then refresh.",
-                        ),
+                        .child(tr("rcpt.no_fields")),
                 )
                 .child(
                     Button::new("refresh-fields")
                         .outline()
-                        .label("Refresh from template")
+                        .label(tr("rcpt.refresh"))
                         .on_click(cx.listener(|this, _, _, cx| this.refresh_fields(cx))),
                 )
                 .into_any_element();
         }
 
-        let mut list = v_flex().gap_3().child(field_label("Field mapping", cx));
+        let mut list = v_flex().gap_3().child(field_label("rcpt.mapping", cx));
         for field in &loaded.fields {
             let selected = loaded.mapping.get(field).cloned();
             let field_name = field.clone();
@@ -1593,7 +1618,7 @@ impl MainWindow {
             let none_field = field_name.clone();
             let mut chips = h_flex().gap_2().flex_wrap().child(
                 Button::new(SharedString::from(format!("map-{field}-none")))
-                    .label("— none —")
+                    .label(tr("rcpt.none"))
                     .selected(selected.is_none())
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.set_mapping(none_field.clone(), None, cx)
@@ -1628,7 +1653,7 @@ impl MainWindow {
         list.child(
             Button::new("refresh-fields")
                 .ghost()
-                .label("Refresh from template")
+                .label(tr("rcpt.refresh"))
                 .on_click(cx.listener(|this, _, _, cx| this.refresh_fields(cx))),
         )
         .into_any_element()
@@ -1642,18 +1667,18 @@ impl MainWindow {
             .items_center()
             .gap_5()
             .flex_wrap()
-            .child(stat("Will send", loaded.sendable(), theme.success))
-            .child(stat("Bad email", report.invalid_email, theme.danger))
-            .child(stat("Duplicates", report.duplicates, theme.warning))
-            .child(stat("Missing data", report.missing_fields, theme.danger))
+            .child(stat("rcpt.will_send", loaded.sendable(), theme.success))
+            .child(stat("rcpt.bad_email", report.invalid_email, theme.danger))
+            .child(stat("rcpt.duplicates", report.duplicates, theme.warning))
+            .child(stat("rcpt.missing", report.missing_fields, theme.danger))
             .child(
                 Button::new("toggle-dedupe")
                     .outline()
                     .selected(loaded.dedupe)
                     .label(if loaded.dedupe {
-                        "De-duplicate: on"
+                        tr("rcpt.dedupe_on")
                     } else {
-                        "De-duplicate: off"
+                        tr("rcpt.dedupe_off")
                     })
                     .on_click(cx.listener(|this, _, _, cx| this.toggle_dedupe(cx))),
             )
@@ -1663,7 +1688,7 @@ impl MainWindow {
         // Choose a bounded set of columns: email + mapped fields, or the first
         // few columns when nothing is mapped yet.
         let email_col = loaded.email_col;
-        let mut columns: Vec<(String, usize)> = vec![("Email".to_string(), email_col)];
+        let mut columns: Vec<(String, usize)> = vec![(tr("rcpt.email"), email_col)];
         if loaded.mapping.is_empty() {
             for (idx, header) in loaded.table.headers.iter().enumerate() {
                 if idx == email_col || columns.len() >= 5 {
@@ -1687,7 +1712,7 @@ impl MainWindow {
             .py_1p5()
             .gap_2()
             .bg(cx.theme().secondary)
-            .child(div().w(px(96.)).text_xs().child("Status"))
+            .child(div().w(px(96.)).text_xs().child(tr("rcpt.status")))
             .children(columns.iter().map(|(name, _)| {
                 div()
                     .flex_1()
@@ -1781,7 +1806,46 @@ impl MainWindow {
 
     /// Assemble a [`CampaignPlan`] from the current account, template, and the
     /// sendable recipient rows.
-    fn build_campaign_plan(&self, cx: &App) -> Result<CampaignPlan, String> {
+    /// Sending settings parsed from the pre-flight inputs, falling back to
+    /// defaults for empty/invalid entries.
+    fn sending_config(&self, cx: &App) -> SendingConfig {
+        let d = SendingConfig::default();
+        let mps = self
+            .send_mps
+            .read(cx)
+            .value()
+            .trim()
+            .parse::<f32>()
+            .ok()
+            .filter(|v| *v > 0.0)
+            .unwrap_or(d.messages_per_second);
+        let retry_limit = self
+            .send_retry
+            .read(cx)
+            .value()
+            .trim()
+            .parse::<u32>()
+            .unwrap_or(d.retry_limit);
+        let stop_after_failures = self
+            .send_stop
+            .read(cx)
+            .value()
+            .trim()
+            .parse::<u32>()
+            .unwrap_or(d.stop_after_failures);
+        SendingConfig {
+            messages_per_second: mps,
+            retry_limit,
+            stop_after_failures,
+        }
+    }
+
+    /// Shared prerequisites for any send: account (+ keychain secret), templates,
+    /// and sending settings.
+    fn resolve_send_context(
+        &self,
+        cx: &App,
+    ) -> Result<(Account, String, String, String, SendingConfig), String> {
         let account_id = self
             .active_account_id()
             .ok_or("Add and select a sending account first (Accounts step).")?;
@@ -1793,6 +1857,17 @@ impl MainWindow {
         let secret = secrets::get(&account.id)
             .map_err(|e| e.to_string())?
             .ok_or("No secret is stored for this account — re-add it in the Accounts step.")?;
+
+        let subject = self.template.subject.read(cx).value().to_string();
+        let body = self.template.body.read(cx).value().to_string();
+        if subject.trim().is_empty() && body.trim().is_empty() {
+            return Err("Write a subject or body in the Template step.".into());
+        }
+        Ok((account, secret, subject, body, self.sending_config(cx)))
+    }
+
+    fn build_campaign_plan(&self, cx: &App) -> Result<CampaignPlan, String> {
+        let (account, secret, subject, body, cfg) = self.resolve_send_context(cx)?;
 
         let loaded = match &self.recipients {
             RecipientsState::Loaded(l) => l,
@@ -1820,13 +1895,6 @@ impl MainWindow {
             });
         }
 
-        let subject = self.template.subject.read(cx).value().to_string();
-        let body = self.template.body.read(cx).value().to_string();
-        if subject.trim().is_empty() && body.trim().is_empty() {
-            return Err("Write a subject or body in the Template step.".into());
-        }
-
-        let cfg = SendingConfig::default();
         Ok(CampaignPlan {
             account,
             secret,
@@ -1838,6 +1906,50 @@ impl MainWindow {
             stop_after_failures: cfg.stop_after_failures,
             recipients,
         })
+    }
+
+    /// A one-recipient plan for the "send test" button, using the current
+    /// preview row's data so placeholders render realistically.
+    fn build_test_plan(&self, to: &str, cx: &App) -> Result<CampaignPlan, String> {
+        let (account, secret, subject, body, cfg) = self.resolve_send_context(cx)?;
+        Ok(CampaignPlan {
+            account,
+            secret,
+            subject_template: subject,
+            body_template: body,
+            generate_text_alt: true,
+            messages_per_second: cfg.messages_per_second,
+            retry_limit: cfg.retry_limit,
+            stop_after_failures: cfg.stop_after_failures,
+            recipients: vec![CampaignRecipient {
+                index: 0,
+                email: to.to_string(),
+                context: self.preview_context(cx),
+            }],
+        })
+    }
+
+    fn on_send_test(&mut self, cx: &mut Context<Self>) {
+        let to = self.test_email.read(cx).value().trim().to_string();
+        if !is_email(&to) {
+            self.send_notice = Some(Notice {
+                ok: false,
+                text: tr("send.test_invalid"),
+            });
+            cx.notify();
+            return;
+        }
+        match self.build_test_plan(&to, cx) {
+            Ok(plan) => {
+                self.sending = true;
+                self.summary = None;
+                self.progress = None;
+                self.send_notice = None;
+                self.mail.command(Command::StartCampaign(Box::new(plan)));
+            }
+            Err(text) => self.send_notice = Some(Notice { ok: false, text }),
+        }
+        cx.notify();
     }
 
     fn on_send(&mut self, cx: &mut Context<Self>) {
@@ -1892,7 +2004,7 @@ impl MainWindow {
             files: true,
             directories: false,
             multiple: false,
-            prompt: Some("Open outcome report to resume".into()),
+            prompt: Some(tr("send.resume_prompt").into()),
         });
         cx.spawn(async move |this, cx| {
             let selected = match paths.await {
@@ -1920,7 +2032,7 @@ impl MainWindow {
             Err(e) => {
                 self.send_notice = Some(Notice {
                     ok: false,
-                    text: format!("Could not read report: {e}"),
+                    text: format!("{}: {e}", tr("send.resume_read_err")),
                 });
             }
             Ok(rows) => {
@@ -1943,8 +2055,7 @@ impl MainWindow {
                     self.resume = None;
                     self.send_notice = Some(Notice {
                         ok: true,
-                        text: "That report has no failed or cancelled rows — nothing to resume."
-                            .into(),
+                        text: tr("send.resume_none"),
                     });
                 } else {
                     let source = path
@@ -2000,7 +2111,7 @@ impl MainWindow {
         }
         v_flex()
             .gap_1()
-            .child(field_label("Sending account", cx))
+            .child(field_label("send.account", cx))
             .child(h_flex().gap_2().flex_wrap().children(chips))
     }
 
@@ -2008,10 +2119,10 @@ impl MainWindow {
         let account_label = self
             .active_account_id()
             .and_then(|id| self.store.get(&id).map(|a| a.display.clone()))
-            .unwrap_or_else(|| "— none —".to_string());
+            .unwrap_or_else(|| tr("send.none"));
         let subject = self.template.subject.read(cx).value().to_string();
         let subject = if subject.trim().is_empty() {
-            "(empty)".to_string()
+            tr("send.empty")
         } else {
             subject
         };
@@ -2021,33 +2132,30 @@ impl MainWindow {
 
         let mut warnings: Vec<String> = Vec::new();
         if self.store.accounts.is_empty() {
-            warnings.push("No sending account — add one in the Accounts step.".into());
+            warnings.push(tr("send.warn_no_account"));
         }
         match &self.recipients {
             RecipientsState::Loaded(l) => {
                 if sendable == 0 {
-                    warnings.push("No valid recipients to send to.".into());
+                    warnings.push(tr("send.warn_no_valid"));
                 }
                 let flagged = l.report.invalid_email + l.report.missing_fields;
                 if flagged > 0 {
-                    warnings.push(format!("{flagged} rows will be skipped (bad email or missing data)."));
+                    warnings.push(t!("send.warn_skipped", n = flagged).to_string());
                 }
                 if l.dedupe && l.report.duplicates > 0 {
-                    warnings.push(format!(
-                        "{} duplicate rows will be skipped (de-dupe is on).",
-                        l.report.duplicates
-                    ));
+                    warnings.push(t!("send.warn_dupes", n = l.report.duplicates).to_string());
                 }
             }
-            _ => warnings.push("No recipient list loaded — add one in the Recipients step.".into()),
+            _ => warnings.push(tr("send.warn_no_list")),
         }
 
         let can_send = !self.store.accounts.is_empty() && sendable > 0;
 
         let send_label = if self.resume.is_some() {
-            format!("Resume {sendable} emails")
+            t!("send.resume_btn", n = sendable).to_string()
         } else {
-            format!("Send {sendable} emails")
+            t!("send.send_btn", n = sendable).to_string()
         };
 
         v_flex()
@@ -2055,6 +2163,7 @@ impl MainWindow {
             .max_w(px(620.))
             .child(self.render_account_picker(cx))
             .child(self.render_resume_control(cx))
+            .child(self.render_sending_settings(cx))
             .child(
                 v_flex()
                     .gap_2()
@@ -2062,15 +2171,15 @@ impl MainWindow {
                     .rounded(cx.theme().radius)
                     .border_1()
                     .border_color(cx.theme().border)
-                    .child(summary_row("Account", account_label, cx))
-                    .child(summary_row("Subject", subject, cx))
+                    .child(summary_row("send.f_account", account_label, cx))
+                    .child(summary_row("send.f_subject", subject, cx))
                     .child(summary_row(
-                        "Recipients",
-                        format!("{sendable} will be sent"),
+                        "send.f_recipients",
+                        t!("send.will_be_sent", n = sendable).to_string(),
                         cx,
                     ))
                     .child(summary_row(
-                        "Est. duration",
+                        "send.f_duration",
                         format!("~{}", format_duration(eta_secs)),
                         cx,
                     )),
@@ -2093,6 +2202,7 @@ impl MainWindow {
                 };
                 this.child(div().text_sm().text_color(color).child(notice.text))
             })
+            .child(self.render_test_send(cx))
             .child(
                 Button::new("send-campaign")
                     .primary()
@@ -2100,6 +2210,38 @@ impl MainWindow {
                     .label(send_label)
                     .disabled(!can_send)
                     .on_click(cx.listener(|this, _, _, cx| this.on_send(cx))),
+            )
+    }
+
+    fn render_sending_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex()
+            .gap_1()
+            .child(field_label("send.settings", cx))
+            .child(
+                h_flex()
+                    .gap_3()
+                    .child(div().flex_1().child(labeled("send.mps", &self.send_mps, cx)))
+                    .child(div().flex_1().child(labeled("send.retry", &self.send_retry, cx)))
+                    .child(div().flex_1().child(labeled("send.stop", &self.send_stop, cx))),
+            )
+    }
+
+    fn render_test_send(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex()
+            .gap_1()
+            .child(field_label("send.test_label", cx))
+            .child(
+                h_flex()
+                    .gap_2()
+                    .items_end()
+                    .child(div().flex_1().child(Input::new(&self.test_email)))
+                    .child(
+                        Button::new("send-test")
+                            .outline()
+                            .label(tr("send.test_btn"))
+                            .disabled(self.store.accounts.is_empty())
+                            .on_click(cx.listener(|this, _, _, cx| this.on_send_test(cx))),
+                    ),
             )
     }
 
@@ -2115,15 +2257,20 @@ impl MainWindow {
                 .border_color(cx.theme().border)
                 .bg(cx.theme().secondary)
                 .child(
-                    div().text_sm().child(format!(
-                        "Resuming from {} — {} failed, {} cancelled",
-                        r.source, r.failed, r.skipped
-                    )),
+                    div().text_sm().child(
+                        t!(
+                            "send.resuming",
+                            source = r.source,
+                            failed = r.failed,
+                            cancelled = r.skipped
+                        )
+                        .to_string(),
+                    ),
                 )
                 .child(
                     Button::new("clear-resume")
                         .ghost()
-                        .label("Clear")
+                        .label(tr("common.clear"))
                         .on_click(cx.listener(|this, _, _, cx| this.clear_resume(cx))),
                 )
                 .into_any_element(),
@@ -2131,7 +2278,7 @@ impl MainWindow {
                 .child(
                     Button::new("resume-report")
                         .ghost()
-                        .label("Resume from outcome report…")
+                        .label(tr("send.resume_load"))
                         .on_click(cx.listener(|this, _, _, cx| this.on_load_resume_report(cx))),
                 )
                 .into_any_element(),
@@ -2157,8 +2304,8 @@ impl MainWindow {
         };
         let eta = p
             .eta_secs
-            .map(|s| format!("~{} left", format_duration(s)))
-            .unwrap_or_else(|| "estimating…".to_string());
+            .map(|s| t!("send.eta_left", d = format_duration(s)).to_string())
+            .unwrap_or_else(|| tr("send.estimating"));
 
         v_flex()
             .gap_3()
@@ -2168,10 +2315,10 @@ impl MainWindow {
                 h_flex()
                     .gap_5()
                     .flex_wrap()
-                    .child(stat("Sent", p.sent, cx.theme().success))
-                    .child(stat("Failed", p.failed, cx.theme().danger))
-                    .child(stat("Skipped", p.skipped, cx.theme().warning))
-                    .child(stat("Total", p.total, cx.theme().foreground))
+                    .child(stat("send.sent", p.sent, cx.theme().success))
+                    .child(stat("send.failed", p.failed, cx.theme().danger))
+                    .child(stat("send.skipped", p.skipped, cx.theme().warning))
+                    .child(stat("send.total", p.total, cx.theme().foreground))
                     .child(
                         div()
                             .text_xs()
@@ -2186,24 +2333,26 @@ impl MainWindow {
                     .child(
                         Button::new("cancel-campaign")
                             .danger()
-                            .label("Cancel")
+                            .label(tr("common.cancel"))
                             .on_click(cx.listener(|this, _, _, cx| this.on_cancel_send(cx))),
                     )
                     .child(
                         div()
                             .text_xs()
                             .text_color(cx.theme().muted_foreground)
-                            .child("Cancel stops upcoming emails; those already delivered stay delivered."),
+                            .child(tr("send.cancel_hint")),
                     ),
             )
     }
 
     fn render_finished(&self, summary: &CampaignSummary, cx: &mut Context<Self>) -> impl IntoElement {
         let (headline, color) = match &summary.state {
-            CampaignState::Completed => ("Campaign complete".to_string(), cx.theme().success),
-            CampaignState::Cancelled => ("Campaign cancelled".to_string(), cx.theme().warning),
-            CampaignState::Stopped(reason) => (format!("Stopped — {reason}"), cx.theme().danger),
-            CampaignState::Running => ("Finishing…".to_string(), cx.theme().foreground),
+            CampaignState::Completed => (tr("send.done"), cx.theme().success),
+            CampaignState::Cancelled => (tr("send.cancelled"), cx.theme().warning),
+            CampaignState::Stopped(reason) => {
+                (format!("{} — {reason}", tr("send.stopped")), cx.theme().danger)
+            }
+            CampaignState::Running => (tr("send.finishing"), cx.theme().foreground),
         };
         let recent = self
             .progress
@@ -2219,15 +2368,15 @@ impl MainWindow {
                 h_flex()
                     .gap_5()
                     .flex_wrap()
-                    .child(stat("Sent", summary.sent, cx.theme().success))
-                    .child(stat("Failed", summary.failed, cx.theme().danger))
-                    .child(stat("Skipped", summary.skipped, cx.theme().warning))
-                    .child(stat("Total", summary.total, cx.theme().foreground))
+                    .child(stat("send.sent", summary.sent, cx.theme().success))
+                    .child(stat("send.failed", summary.failed, cx.theme().danger))
+                    .child(stat("send.skipped", summary.skipped, cx.theme().warning))
+                    .child(stat("send.total", summary.total, cx.theme().foreground))
                     .child(
                         div()
                             .text_xs()
                             .text_color(cx.theme().muted_foreground)
-                            .child(format!("in {}", format_duration(summary.elapsed_secs))),
+                            .child(t!("send.in_duration", d = format_duration(summary.elapsed_secs)).to_string()),
                     ),
             )
             .child(self.render_recent_rows(&recent, cx))
@@ -2246,13 +2395,13 @@ impl MainWindow {
                         Button::new("export-report")
                             .outline()
                             .icon(IconName::ArrowDown)
-                            .label("Export report (CSV)")
+                            .label(tr("send.export"))
                             .on_click(cx.listener(|this, _, _, cx| this.on_export_report(cx))),
                     )
                     .child(
                         Button::new("send-again")
                             .ghost()
-                            .label("Back to pre-flight")
+                            .label(tr("send.back"))
                             .on_click(cx.listener(|this, _, _, cx| this.start_again(cx))),
                     ),
             )
@@ -2292,7 +2441,7 @@ impl MainWindow {
                     .bg(cx.theme().secondary)
                     .text_xs()
                     .text_color(cx.theme().muted_foreground)
-                    .child("Recent activity"),
+                    .child(tr("send.recent_activity")),
             )
             .children(rows)
     }
@@ -2320,6 +2469,7 @@ impl MainWindow {
             email_column,
             mapping,
             dedupe,
+            sending: self.sending_config(cx),
         }
     }
 
@@ -2350,11 +2500,15 @@ impl MainWindow {
             self.perform(action, window, cx);
             return;
         }
+        let title = tr("proj.discard_title");
+        let detail = tr("proj.discard_detail");
+        let yes = tr("proj.discard_yes");
+        let cancel = tr("common.cancel");
         let answer = window.prompt(
             PromptLevel::Warning,
-            "Discard unsaved changes?",
-            Some("Your current campaign has changes that haven't been saved."),
-            &["Discard changes", "Cancel"],
+            &title,
+            Some(&detail),
+            &[yes.as_str(), cancel.as_str()],
             cx,
         );
         cx.spawn_in(window, async move |this, cx| {
@@ -2380,6 +2534,13 @@ impl MainWindow {
         self.template
             .body
             .update(cx, |s, cx| s.set_value("", window, cx));
+        let d = SendingConfig::default();
+        self.send_mps
+            .update(cx, |s, cx| s.set_value(d.messages_per_second.to_string(), window, cx));
+        self.send_retry
+            .update(cx, |s, cx| s.set_value(d.retry_limit.to_string(), window, cx));
+        self.send_stop
+            .update(cx, |s, cx| s.set_value(d.stop_after_failures.to_string(), window, cx));
         self.selected_account = None;
         self.recipients = RecipientsState::Empty;
         self.preview_row = 0;
@@ -2389,7 +2550,7 @@ impl MainWindow {
         self.send_notice = None;
         self.resume = None;
         self.project_path = None;
-        self.project_name = "Untitled campaign".into();
+        self.project_name = tr("proj.untitled");
         self.project_notice = None;
         self.mark_saved(cx);
         cx.notify();
@@ -2400,7 +2561,7 @@ impl MainWindow {
             files: true,
             directories: false,
             multiple: false,
-            prompt: Some("Open campaign project".into()),
+            prompt: Some(tr("proj.open_prompt").into()),
         });
         cx.spawn_in(_window, async move |this, cx| {
             let selected = match paths.await {
@@ -2420,7 +2581,7 @@ impl MainWindow {
             Err(e) => {
                 self.project_notice = Some(Notice {
                     ok: false,
-                    text: format!("Could not open project: {e}"),
+                    text: format!("{}: {e}", tr("proj.open_err")),
                 });
                 cx.notify();
                 return;
@@ -2438,6 +2599,16 @@ impl MainWindow {
             .body
             .update(cx, |s, cx| s.set_value(body, window, cx));
 
+        self.send_mps.update(cx, |s, cx| {
+            s.set_value(project.sending.messages_per_second.to_string(), window, cx)
+        });
+        self.send_retry.update(cx, |s, cx| {
+            s.set_value(project.sending.retry_limit.to_string(), window, cx)
+        });
+        self.send_stop.update(cx, |s, cx| {
+            s.set_value(project.sending.stop_after_failures.to_string(), window, cx)
+        });
+
         self.selected_account = project.account.as_ref().map(|a| a.id.clone());
         self.project_path = Some(path.clone());
         self.project_name = project.name.clone();
@@ -2448,7 +2619,7 @@ impl MainWindow {
         self.resume = None;
         self.project_notice = Some(Notice {
             ok: true,
-            text: format!("Opened {}", path.display()),
+            text: t!("proj.opened", path = path.display()).to_string(),
         });
 
         self.recents.push(&path);
@@ -2506,7 +2677,7 @@ impl MainWindow {
         if let Err(e) = std::fs::write(dir.join(&html_file), &body) {
             self.project_notice = Some(Notice {
                 ok: false,
-                text: format!("Could not write template file: {e}"),
+                text: format!("{}: {e}", tr("proj.write_err")),
             });
             cx.notify();
             return;
@@ -2540,13 +2711,13 @@ impl MainWindow {
                 generate_text_alt: true,
             },
             recipients,
-            sending: SendingConfig::default(),
+            sending: self.sending_config(cx),
         };
 
         if let Err(e) = project.save(&path) {
             self.project_notice = Some(Notice {
                 ok: false,
-                text: format!("Could not save project: {e}"),
+                text: format!("{}: {e}", tr("proj.save_err")),
             });
             cx.notify();
             return;
@@ -2559,7 +2730,7 @@ impl MainWindow {
         self.mark_saved(cx);
         self.project_notice = Some(Notice {
             ok: true,
-            text: "Project saved.".into(),
+            text: tr("proj.saved"),
         });
         cx.notify();
     }
@@ -2589,7 +2760,7 @@ impl MainWindow {
                                     div()
                                         .text_xs()
                                         .text_color(cx.theme().warning)
-                                        .child("• unsaved"),
+                                        .child(tr("top.unsaved")),
                                 )
                             })
                             .when_some(self.project_notice.clone(), |this, notice| {
@@ -2604,28 +2775,30 @@ impl MainWindow {
                     .child(
                         h_flex()
                             .gap_2()
+                            .items_center()
+                            .child(self.render_language_picker(cx))
                             .child(
                                 Button::new("proj-new")
                                     .ghost()
-                                    .label("New")
+                                    .label(tr("top.new"))
                                     .on_click(cx.listener(|this, _, window, cx| this.on_new(window, cx))),
                             )
                             .child(
                                 Button::new("proj-open")
                                     .ghost()
-                                    .label("Open")
+                                    .label(tr("top.open"))
                                     .on_click(cx.listener(|this, _, window, cx| this.on_open(window, cx))),
                             )
                             .child(
                                 Button::new("proj-save")
                                     .primary()
-                                    .label("Save")
+                                    .label(tr("top.save"))
                                     .on_click(cx.listener(|this, _, window, cx| this.on_save(window, cx))),
                             )
                             .child(
                                 Button::new("proj-save-as")
                                     .ghost()
-                                    .label("Save As")
+                                    .label(tr("top.save_as"))
                                     .on_click(cx.listener(|this, _, window, cx| this.on_save_as(window, cx))),
                             ),
                     ),
@@ -2660,9 +2833,24 @@ impl MainWindow {
                 div()
                     .text_xs()
                     .text_color(cx.theme().muted_foreground)
-                    .child("Recent"),
+                    .child(tr("top.recent")),
             )
             .children(chips)
+    }
+
+    fn render_language_picker(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let mut chips = Vec::new();
+        for (code, label) in LANGUAGES {
+            let code = *code;
+            chips.push(
+                Button::new(SharedString::from(format!("lang-{code}")))
+                    .ghost()
+                    .label(*label)
+                    .selected(self.language == code)
+                    .on_click(cx.listener(move |this, _, _, cx| this.on_set_language(code, cx))),
+            );
+        }
+        h_flex().gap_1().children(chips)
     }
 }
 
@@ -2699,55 +2887,56 @@ fn relative_or_absolute(dir: &Path, file: &Path) -> String {
     }
 }
 
-fn field_label(text: &'static str, cx: &Context<MainWindow>) -> impl IntoElement {
+/// A muted caption from an i18n key.
+fn field_label(key: &'static str, cx: &Context<MainWindow>) -> impl IntoElement {
     div()
         .text_xs()
         .text_color(cx.theme().muted_foreground)
-        .child(text)
+        .child(tr(key))
 }
 
-/// A labelled text field.
+/// A labelled text field; `label_key` is an i18n key.
 fn labeled(
-    label: &'static str,
+    label_key: &'static str,
     input: &Entity<InputState>,
     cx: &Context<MainWindow>,
 ) -> impl IntoElement {
     v_flex()
         .gap_1()
-        .child(field_label(label, cx))
+        .child(field_label(label_key, cx))
         .child(Input::new(input))
 }
 
-/// A small "label: N" statistic with a coloured count.
-fn stat(label: &'static str, value: usize, color: Hsla) -> impl IntoElement {
+/// A small "label: N" statistic with a coloured count; `label_key` is i18n.
+fn stat(label_key: &'static str, value: usize, color: Hsla) -> impl IntoElement {
     h_flex()
         .gap_1p5()
         .items_baseline()
         .child(div().text_lg().text_color(color).child(value.to_string()))
-        .child(div().text_xs().child(label))
+        .child(div().text_xs().child(tr(label_key)))
 }
 
 fn status_style(status: &RowStatus, cx: &App) -> (Hsla, SharedString) {
     let theme = cx.theme();
     match status {
-        RowStatus::Ok => (theme.success, "OK".into()),
-        RowStatus::InvalidEmail => (theme.danger, "Bad email".into()),
-        RowStatus::Duplicate => (theme.warning, "Duplicate".into()),
-        RowStatus::MissingFields(_) => (theme.danger, "Missing".into()),
+        RowStatus::Ok => (theme.success, tr("status.ok").into()),
+        RowStatus::InvalidEmail => (theme.danger, tr("status.bad_email").into()),
+        RowStatus::Duplicate => (theme.warning, tr("status.duplicate").into()),
+        RowStatus::MissingFields(_) => (theme.danger, tr("status.missing").into()),
     }
 }
 
 fn outcome_style(status: &OutcomeStatus, cx: &App) -> (Hsla, SharedString) {
     let theme = cx.theme();
     match status {
-        OutcomeStatus::Sent => (theme.success, "sent".into()),
-        OutcomeStatus::Failed => (theme.danger, "failed".into()),
-        OutcomeStatus::Skipped => (theme.warning, "skipped".into()),
+        OutcomeStatus::Sent => (theme.success, tr("outcome.sent").into()),
+        OutcomeStatus::Failed => (theme.danger, tr("outcome.failed").into()),
+        OutcomeStatus::Skipped => (theme.warning, tr("outcome.skipped").into()),
     }
 }
 
-/// A "Label   value" line for the pre-flight summary card.
-fn summary_row(label: &'static str, value: String, cx: &Context<MainWindow>) -> impl IntoElement {
+/// A "Label   value" line for the pre-flight summary card; `label_key` is i18n.
+fn summary_row(label_key: &'static str, value: String, cx: &Context<MainWindow>) -> impl IntoElement {
     h_flex()
         .gap_3()
         .items_baseline()
@@ -2756,7 +2945,7 @@ fn summary_row(label: &'static str, value: String, cx: &Context<MainWindow>) -> 
                 .w(px(110.))
                 .text_xs()
                 .text_color(cx.theme().muted_foreground)
-                .child(label),
+                .child(tr(label_key)),
         )
         .child(div().flex_1().text_sm().truncate().child(value))
 }
@@ -2774,13 +2963,13 @@ fn format_duration(secs: u64) -> String {
 
 fn kind_button(
     id: &'static str,
-    label: &'static str,
+    label_key: &'static str,
     value: ProviderKind,
     current: ProviderKind,
     cx: &mut Context<MainWindow>,
 ) -> Button {
     Button::new(id)
-        .label(label)
+        .label(tr(label_key))
         .selected(value == current)
         .on_click(cx.listener(move |this, _, _, cx| {
             this.form.kind = value;
@@ -2791,13 +2980,13 @@ fn kind_button(
 
 fn tls_button(
     id: &'static str,
-    label: &'static str,
+    label_key: &'static str,
     value: TlsMode,
     current: TlsMode,
     cx: &mut Context<MainWindow>,
 ) -> Button {
     Button::new(id)
-        .label(label)
+        .label(tr(label_key))
         .selected(value == current)
         .on_click(cx.listener(move |this, _, _, cx| {
             this.form.tls = value;
@@ -2807,13 +2996,13 @@ fn tls_button(
 
 fn region_button(
     id: &'static str,
-    label: &'static str,
+    label_key: &'static str,
     value: MailgunRegion,
     current: MailgunRegion,
     cx: &mut Context<MainWindow>,
 ) -> Button {
     Button::new(id)
-        .label(label)
+        .label(tr(label_key))
         .selected(value == current)
         .on_click(cx.listener(move |this, _, _, cx| {
             this.form.region = value;

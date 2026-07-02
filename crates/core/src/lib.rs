@@ -4,4 +4,5 @@
 pub mod import;
 pub mod mapping;
 pub mod project;
+pub mod settings;
 pub mod template;

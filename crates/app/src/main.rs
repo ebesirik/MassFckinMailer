@@ -4,11 +4,19 @@ use gpui::*;
 use gpui_component::Root;
 use gpui_component_assets::Assets;
 use main_window::MainWindow;
+use mmm_core::settings::AppSettings;
+
+// Load all translations from `crates/app/locales/` at compile time; English is
+// the fallback for any missing key.
+rust_i18n::i18n!("locales", fallback = "en");
 
 fn main() {
     let app = Application::new().with_assets(Assets);
 
     app.run(move |cx| {
+        // Apply the saved UI language before the first render.
+        rust_i18n::set_locale(&AppSettings::load().language);
+
         // Must be called before using any GPUI Component features.
         gpui_component::init(cx);
 

@@ -25,6 +25,7 @@ gpui-component-assets.workspace = true
 mmm-core.workspace = true
 mmm-engine.workspace = true
 mmm-providers.workspace = true
+rust-i18n = "3"
 
 [dev-dependencies]
 # Used only by `examples/gen_icon.rs` to render assets/icon.{png,ico}.
