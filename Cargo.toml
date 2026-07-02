@@ -1,0 +1,67 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/core",
+    "crates/providers",
+    "crates/engine",
+    "crates/app",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+# UI — gpui is pre-1.0 with frequent breaking changes: keep these pinned exactly
+# and upgrade all three together (gpui-component 0.5.1 requires gpui ^0.2.2).
+gpui = "=0.2.2"
+gpui-component = "=0.5.1"
+gpui-component-assets = "=0.5.1"
+
+# Async / channels
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+tokio-util = "0.7"
+flume = "0.11"
+async-trait = "0.1"
+
+# Data / serialization
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+regex = "1"
+csv = "1"
+calamine = "0.35"
+
+# Email providers
+lettre = { version = "0.11", default-features = false, features = [
+    "smtp-transport",
+    "builder",
+    "hostname",
+    "pool",
+    "tokio1",
+    "tokio1-rustls-tls",
+] }
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls",
+    "json",
+    "multipart",
+] }
+
+# Secrets / paths
+dirs = "5"
+
+# Errors
+thiserror = "2"
+anyhow = "1"
+
+# Internal crates
+mmm-core = { path = "crates/core" }
+mmm-providers = { path = "crates/providers" }
+mmm-engine = { path = "crates/engine" }
+
+[profile.dev]
+# gpui is slow in unoptimized builds; optimize deps even in dev
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3

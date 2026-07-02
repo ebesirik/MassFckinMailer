@@ -1,0 +1,18 @@
+[package]
+name = "mmm-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "massfckinmailer"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+gpui.workspace = true
+gpui-component.workspace = true
+gpui-component-assets.workspace = true
+mmm-core.workspace = true
+mmm-engine.workspace = true
+mmm-providers.workspace = true
