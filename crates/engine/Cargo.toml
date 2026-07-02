@@ -8,4 +8,10 @@ license.workspace = true
 flume.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
+governor.workspace = true
+csv.workspace = true
+mmm-core.workspace = true
 mmm-providers.workspace = true
+
+[dev-dependencies]
+async-trait.workspace = true

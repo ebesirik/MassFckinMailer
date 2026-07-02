@@ -11,3 +11,5 @@ regex.workspace = true
 thiserror.workspace = true
 csv.workspace = true
 calamine.workspace = true
+minijinja.workspace = true
+dirs.workspace = true

@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use gpui::prelude::FluentBuilder as _;
@@ -10,12 +10,20 @@ use gpui_component::{
     input::{Input, InputState},
     progress::Progress,
     sidebar::{Sidebar, SidebarGroup, SidebarHeader, SidebarMenu, SidebarMenuItem},
+    text::TextView,
     v_flex,
 };
 use mmm_core::import::{self, RecipientTable, SourceKind};
 use mmm_core::mapping::{self, RowStatus, ValidationReport};
-use mmm_core::template::{extract_placeholders, normalize_placeholders};
-use mmm_engine::{Command, Event, MailRuntime};
+use mmm_core::project::{
+    AccountRef, CURRENT_VERSION, PROJECT_SUFFIX, Project, RecentProjects, RecipientSource,
+    SendingConfig, TemplateSpec,
+};
+use mmm_core::template::{self, extract_placeholders, normalize_placeholders};
+use mmm_engine::{
+    CampaignPlan, CampaignProgress, CampaignRecipient, CampaignState, CampaignSummary, Command,
+    Event, MailRuntime, OutcomeStatus, RowOutcome,
+};
 use mmm_providers::{
     Account, AccountConfig, AccountStore, MailgunConfig, MailgunRegion, ProviderKind, SmtpConfig,
     TlsMode, account::new_account_id, secrets,
@@ -77,25 +85,53 @@ impl Section {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum JobState {
-    Idle,
-    Running {
-        done: u32,
-        total: u32,
-    },
-    Finished {
-        done: u32,
-        total: u32,
-        cancelled: bool,
-    },
-}
-
 /// A transient status line under the account form (test result, save error, …).
 #[derive(Debug, Clone)]
 struct Notice {
     ok: bool,
     text: String,
+}
+
+/// Preset applied when re-parsing recipients for a loaded project: the saved
+/// email column header and field→column mapping.
+type Preset = (String, BTreeMap<String, String>);
+
+/// A comparable snapshot of the campaign's persistable state. Dirty-tracking
+/// compares the current snapshot to the last-saved one, avoiding fragile
+/// change-event bookkeeping.
+#[derive(Debug, Clone, PartialEq)]
+struct ProjectSnapshot {
+    subject: String,
+    body: String,
+    account: Option<String>,
+    source_path: Option<String>,
+    sheet: Option<String>,
+    email_column: Option<String>,
+    mapping: BTreeMap<String, String>,
+    dedupe: bool,
+}
+
+impl ProjectSnapshot {
+    /// Matches a brand-new, untouched campaign.
+    fn fresh() -> Self {
+        Self {
+            subject: String::new(),
+            body: String::new(),
+            account: None,
+            source_path: None,
+            sheet: None,
+            email_column: None,
+            mapping: BTreeMap::new(),
+            dedupe: true,
+        }
+    }
+}
+
+/// A deferred action that must be confirmed if there are unsaved changes.
+enum PendingAction {
+    New,
+    OpenDialog,
+    OpenPath(PathBuf),
 }
 
 // ---- Account form (M1) --------------------------------------------------
@@ -163,9 +199,9 @@ impl TemplateForm {
         });
         let body = cx.new(|cx| {
             InputState::new(window, cx)
+                .code_editor("html")
+                .line_number(true)
                 .placeholder("<p>Hi {{first_name}},</p>")
-                .multi_line(true)
-                .rows(10)
         });
         Self { subject, body }
     }
@@ -226,7 +262,6 @@ struct ParseOutput {
 
 pub struct MainWindow {
     active: Section,
-    job: JobState,
     mail: MailRuntime,
 
     // M1 — accounts
@@ -235,9 +270,26 @@ pub struct MainWindow {
     notice: Option<Notice>,
     testing: bool,
 
-    // M2 — recipients + a minimal template to drive field mapping
+    // M2 — recipients + M3 template
     template: TemplateForm,
     recipients: RecipientsState,
+    /// Which recipient row feeds the live template preview.
+    preview_row: usize,
+
+    // M4 — sending
+    /// Selected sending account id (defaults to the first account).
+    selected_account: Option<String>,
+    sending: bool,
+    progress: Option<CampaignProgress>,
+    summary: Option<CampaignSummary>,
+    send_notice: Option<Notice>,
+
+    // M5 — project files
+    project_path: Option<PathBuf>,
+    project_name: String,
+    saved_snapshot: ProjectSnapshot,
+    recents: RecentProjects,
+    project_notice: Option<Notice>,
 }
 
 fn read_trimmed(input: &Entity<InputState>, cx: &App) -> String {
@@ -273,7 +325,6 @@ impl MainWindow {
 
         Self {
             active: Section::Accounts,
-            job: JobState::Idle,
             mail,
             store,
             form,
@@ -281,26 +332,35 @@ impl MainWindow {
             testing: false,
             template,
             recipients: RecipientsState::Empty,
+            preview_row: 0,
+            selected_account: None,
+            sending: false,
+            progress: None,
+            summary: None,
+            send_notice: None,
+            project_path: None,
+            project_name: "Untitled campaign".into(),
+            saved_snapshot: ProjectSnapshot::fresh(),
+            recents: RecentProjects::load(),
+            project_notice: None,
         }
     }
 
     fn on_engine_event(&mut self, event: Event) {
         match event {
-            Event::JobProgress { done, total } => self.job = JobState::Running { done, total },
-            Event::JobFinished {
-                done,
-                total,
-                cancelled,
-            } => {
-                self.job = JobState::Finished {
-                    done,
-                    total,
-                    cancelled,
-                }
-            }
             Event::TestResult { ok, message, .. } => {
                 self.testing = false;
                 self.notice = Some(Notice { ok, text: message });
+            }
+            Event::CampaignProgress(progress) => {
+                self.progress = Some(progress);
+            }
+            Event::CampaignFinished { summary } => {
+                self.summary = Some(summary);
+                self.sending = false;
+            }
+            Event::ReportExported { ok, message } => {
+                self.send_notice = Some(Notice { ok, text: message });
             }
         }
     }
@@ -464,24 +524,42 @@ impl MainWindow {
             multiple: false,
             prompt: Some("Choose recipient list".into()),
         });
-        self.recipients = RecipientsState::Loading;
-        cx.notify();
-
         cx.spawn(async move |this, cx| {
             let selected = match paths.await {
                 Ok(Ok(Some(paths))) => paths.into_iter().next(),
                 _ => None,
             };
-            let Some(path) = selected else {
-                // Cancelled — return to the empty state.
-                let _ = this.update(cx, |this, cx| {
-                    this.recipients = RecipientsState::Empty;
-                    cx.notify();
-                });
-                return;
-            };
+            if let Some(path) = selected {
+                let _ = this.update(cx, |this, cx| this.spawn_parse(path, None, None, false, cx));
+            }
+        })
+        .detach();
+    }
 
-            let parse_path = path.clone();
+    fn on_select_sheet(&mut self, name: String, cx: &mut Context<Self>) {
+        let path = match &self.recipients {
+            RecipientsState::Loaded(l) => l.path.clone(),
+            _ => return,
+        };
+        self.spawn_parse(path, Some(name), None, false, cx);
+    }
+
+    /// Parse `path` on the background executor, then apply the result. `preset`
+    /// (email column + mapping) is supplied when loading a saved project;
+    /// `from_load` marks the resulting state as the saved baseline.
+    fn spawn_parse(
+        &mut self,
+        path: PathBuf,
+        forced_sheet: Option<String>,
+        preset: Option<Preset>,
+        from_load: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.recipients = RecipientsState::Loading;
+        cx.notify();
+
+        let parse_path = path.clone();
+        cx.spawn(async move |this, cx| {
             let output: Result<ParseOutput, String> = cx
                 .background_executor()
                 .spawn(async move {
@@ -498,7 +576,7 @@ impl MainWindow {
                         Some(SourceKind::Excel) => {
                             let sheets = import::excel_sheet_names(&parse_path)
                                 .map_err(|e| e.to_string())?;
-                            let sheet = sheets.first().cloned();
+                            let sheet = forced_sheet.or_else(|| sheets.first().cloned());
                             let table = import::parse_excel(&parse_path, sheet.as_deref())
                                 .map_err(|e| e.to_string())?;
                             Ok(ParseOutput {
@@ -512,56 +590,37 @@ impl MainWindow {
                 })
                 .await;
 
-            let _ = this.update(cx, |this, cx| this.on_parsed(path, output, cx));
+            let _ = this
+                .update(cx, |this, cx| this.on_parsed(path, output, preset, from_load, cx));
         })
         .detach();
     }
 
-    fn on_select_sheet(&mut self, name: String, cx: &mut Context<Self>) {
-        let (path, sheets) = match &self.recipients {
-            RecipientsState::Loaded(l) => (l.path.clone(), l.sheets.clone()),
-            _ => return,
-        };
-        self.recipients = RecipientsState::Loading;
-        cx.notify();
-
-        let parse_path = path.clone();
-        let parse_name = name.clone();
-        cx.spawn(async move |this, cx| {
-            let table: Result<RecipientTable, String> = cx
-                .background_executor()
-                .spawn(async move {
-                    import::parse_excel(&parse_path, Some(&parse_name)).map_err(|e| e.to_string())
-                })
-                .await;
-
-            let _ = this.update(cx, |this, cx| match table {
-                Ok(table) => this.on_parsed(
-                    path,
-                    Ok(ParseOutput {
-                        sheets,
-                        sheet: Some(name),
-                        table,
-                    }),
-                    cx,
-                ),
-                Err(e) => {
-                    this.recipients = RecipientsState::Error(e);
-                    cx.notify();
-                }
-            });
-        })
-        .detach();
-    }
-
-    fn on_parsed(&mut self, path: PathBuf, output: Result<ParseOutput, String>, cx: &mut Context<Self>) {
+    fn on_parsed(
+        &mut self,
+        path: PathBuf,
+        output: Result<ParseOutput, String>,
+        preset: Option<Preset>,
+        from_load: bool,
+        cx: &mut Context<Self>,
+    ) {
         match output {
             Err(e) => self.recipients = RecipientsState::Error(e),
             Ok(output) => {
                 let table = Rc::new(output.table);
-                let email_col = import::detect_email_column_in(&table).unwrap_or(0);
                 let fields = self.template_fields(cx);
-                let mapping = mapping::auto_map(&fields, &table.headers);
+                let (email_col, mapping) = match &preset {
+                    Some((email_column, mapping)) => {
+                        let col = table.column_index(email_column).unwrap_or_else(|| {
+                            import::detect_email_column_in(&table).unwrap_or(0)
+                        });
+                        (col, mapping.clone())
+                    }
+                    None => (
+                        import::detect_email_column_in(&table).unwrap_or(0),
+                        mapping::auto_map(&fields, &table.headers),
+                    ),
+                };
                 let mut loaded = Loaded {
                     path,
                     sheets: output.sheets,
@@ -575,6 +634,10 @@ impl MainWindow {
                 };
                 loaded.recompute();
                 self.recipients = RecipientsState::Loaded(loaded);
+                self.preview_row = 0;
+                if from_load {
+                    self.mark_saved(cx);
+                }
             }
         }
         cx.notify();
@@ -673,7 +736,7 @@ impl MainWindow {
             )
     }
 
-    fn render_content(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_content(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let section = self.active;
         v_flex()
             .flex_1()
@@ -690,13 +753,13 @@ impl MainWindow {
                 this.child(self.render_accounts(cx))
             })
             .when(section == Section::Template, |this| {
-                this.child(self.render_template(cx))
+                this.child(self.render_template(window, cx))
             })
             .when(section == Section::Recipients, |this| {
                 this.child(self.render_recipients(cx))
             })
             .when(section == Section::Send, |this| {
-                this.child(self.render_bridge_demo(cx))
+                this.child(self.render_send(cx))
             })
     }
 
@@ -892,28 +955,199 @@ impl MainWindow {
             .child(labeled("API key", &self.form.mg_api_key, cx))
     }
 
-    // ---- Template UI (minimal) ------------------------------------------
+    // ---- Template UI (M3) -----------------------------------------------
 
-    fn render_template(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    /// Context for the live preview: the selected recipient row's mapped values,
+    /// with any unmapped placeholder falling back to `[field]` so the preview
+    /// never errors on missing data.
+    fn preview_context(&self, cx: &App) -> BTreeMap<String, String> {
+        let mut context = match &self.recipients {
+            RecipientsState::Loaded(l) => l
+                .table
+                .rows
+                .get(self.preview_row)
+                .map(|row| mapping::build_context(&l.table, row, &l.mapping))
+                .unwrap_or_default(),
+            _ => BTreeMap::new(),
+        };
+        for field in self.template_fields(cx) {
+            context.entry(field.clone()).or_insert_with(|| format!("[{field}]"));
+        }
+        context
+    }
+
+    fn loaded_row_count(&self) -> usize {
+        match &self.recipients {
+            RecipientsState::Loaded(l) => l.table.row_count(),
+            _ => 0,
+        }
+    }
+
+    fn preview_prev(&mut self, cx: &mut Context<Self>) {
+        if self.preview_row > 0 {
+            self.preview_row -= 1;
+            cx.notify();
+        }
+    }
+
+    fn preview_next(&mut self, cx: &mut Context<Self>) {
+        if self.preview_row + 1 < self.loaded_row_count() {
+            self.preview_row += 1;
+            cx.notify();
+        }
+    }
+
+    fn render_template(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         v_flex()
             .gap_4()
-            .max_w(px(760.))
+            .size_full()
             .child(labeled("Subject", &self.template.subject, cx))
+            .child(self.render_placeholder_chips(cx))
             .child(
-                v_flex()
-                    .gap_1()
-                    .child(field_label("Body (HTML)", cx))
-                    .child(Input::new(&self.template.body)),
+                h_flex()
+                    .gap_4()
+                    .w_full()
+                    .items_start()
+                    .child(
+                        v_flex()
+                            .gap_1()
+                            .flex_1()
+                            .child(field_label("Body (HTML)", cx))
+                            .child(
+                                div()
+                                    .h(px(440.))
+                                    .child(Input::new(&self.template.body).h_full()),
+                            ),
+                    )
+                    .child(
+                        v_flex()
+                            .gap_1()
+                            .flex_1()
+                            .child(self.render_preview_nav(cx))
+                            .child(self.render_preview_body(window, cx)),
+                    ),
+            )
+    }
+
+    fn render_placeholder_chips(&self, cx: &mut Context<Self>) -> AnyElement {
+        let headers = match &self.recipients {
+            RecipientsState::Loaded(l) => l.table.headers.clone(),
+            _ => Vec::new(),
+        };
+        if headers.is_empty() {
+            return div()
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child(
+                    "Load a recipient list in the Recipients step to insert placeholder chips. \
+                     You can still type {{field}} manually.",
+                )
+                .into_any_element();
+        }
+
+        let mut row = h_flex()
+            .gap_2()
+            .flex_wrap()
+            .items_center()
+            .child(field_label("Insert field", cx));
+        for (i, header) in headers.iter().enumerate() {
+            let insert = format!("{{{{{}}}}}", template::to_placeholder_ident(header));
+            row = row.child(
+                Button::new(SharedString::from(format!("chip-{i}")))
+                    .label(header.clone())
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        let text = insert.clone();
+                        this.template
+                            .body
+                            .update(cx, |state, cx| state.insert(text, window, cx));
+                        cx.notify();
+                    })),
+            );
+        }
+        row.into_any_element()
+    }
+
+    fn render_preview_nav(&self, cx: &mut Context<Self>) -> AnyElement {
+        let total = self.loaded_row_count();
+        if total == 0 {
+            return h_flex()
+                .gap_2()
+                .items_center()
+                .child(field_label("Preview", cx))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child("(no data loaded — showing field names)"),
+                )
+                .into_any_element();
+        }
+        let current = self.preview_row.min(total - 1) + 1;
+        h_flex()
+            .gap_2()
+            .items_center()
+            .child(field_label("Preview", cx))
+            .child(
+                Button::new("prev-row")
+                    .ghost()
+                    .label("‹ Prev")
+                    .disabled(self.preview_row == 0)
+                    .on_click(cx.listener(|this, _, _, cx| this.preview_prev(cx))),
             )
             .child(
                 div()
                     .text_xs()
                     .text_color(cx.theme().muted_foreground)
-                    .child(
-                        "Placeholders like {{first_name}} (or ##first_name##) become mappable \
-                         fields in Recipients. A rich editor with live preview arrives in M3.",
-                    ),
+                    .child(format!("Row {current} of {total}")),
             )
+            .child(
+                Button::new("next-row")
+                    .ghost()
+                    .label("Next ›")
+                    .disabled(self.preview_row + 1 >= total)
+                    .on_click(cx.listener(|this, _, _, cx| this.preview_next(cx))),
+            )
+            .into_any_element()
+    }
+
+    fn render_preview_body(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let context = self.preview_context(cx);
+        let subject_src = self.template.subject.read(cx).value();
+        let body_src = self.template.body.read(cx).value();
+
+        let subject = match template::render(&subject_src, &context) {
+            Ok(s) => s,
+            Err(e) => format!("⚠ {e}"),
+        };
+        let body_el: AnyElement = match template::render(&body_src, &context) {
+            Ok(html) => div()
+                .flex_1()
+                .overflow_hidden()
+                .child(TextView::html("tpl-preview", html, window, cx))
+                .into_any_element(),
+            Err(e) => div()
+                .text_sm()
+                .text_color(cx.theme().danger)
+                .child(format!("Body error: {e}"))
+                .into_any_element(),
+        };
+
+        v_flex()
+            .h(px(440.))
+            .gap_2()
+            .p_3()
+            .rounded(cx.theme().radius)
+            .border_1()
+            .border_color(cx.theme().border)
+            .overflow_hidden()
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .truncate()
+                    .child(format!("Subject: {subject}")),
+            )
+            .child(body_el)
     }
 
     // ---- Recipients UI --------------------------------------------------
@@ -1219,76 +1453,815 @@ impl MainWindow {
             .child(list)
     }
 
-    /// M0 proof that UI → tokio → UI works: a simulated 200-email campaign
-    /// with live progress and cancellation. Becomes the real send flow in M4.
-    fn render_bridge_demo(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let (done, total, status) = match self.job {
-            JobState::Idle => (0, 200, "Ready.".to_string()),
-            JobState::Running { done, total } => {
-                (done, total, format!("Sending… {done} of {total}"))
-            }
-            JobState::Finished {
-                done,
-                total,
-                cancelled,
-            } => {
-                let label = if cancelled {
-                    format!("Cancelled — {done} of {total} sent.")
-                } else {
-                    format!("Done — all {total} sent.")
-                };
-                (done, total, label)
-            }
+    // ---- Send logic (M4) ------------------------------------------------
+
+    /// The account that will send: the explicit selection, else the first saved.
+    fn active_account_id(&self) -> Option<String> {
+        self.selected_account
+            .clone()
+            .or_else(|| self.store.accounts.first().map(|a| a.id.clone()))
+    }
+
+    /// Count of recipients that will actually be sent (valid rows, plus
+    /// duplicates when de-dupe is off).
+    fn sendable_count(&self) -> usize {
+        match &self.recipients {
+            RecipientsState::Loaded(l) => l.sendable(),
+            _ => 0,
+        }
+    }
+
+    /// Assemble a [`CampaignPlan`] from the current account, template, and the
+    /// sendable recipient rows.
+    fn build_campaign_plan(&self, cx: &App) -> Result<CampaignPlan, String> {
+        let account_id = self
+            .active_account_id()
+            .ok_or("Add and select a sending account first (Accounts step).")?;
+        let account = self
+            .store
+            .get(&account_id)
+            .ok_or("Selected account not found.")?
+            .clone();
+        let secret = secrets::get(&account.id)
+            .map_err(|e| e.to_string())?
+            .ok_or("No secret is stored for this account — re-add it in the Accounts step.")?;
+
+        let loaded = match &self.recipients {
+            RecipientsState::Loaded(l) => l,
+            _ => return Err("Load a recipient list first (Recipients step).".into()),
         };
-        let running = matches!(self.job, JobState::Running { .. });
-        let percentage = if total == 0 {
+
+        let email_col = loaded.email_col;
+        let mut recipients = Vec::new();
+        for (i, status) in loaded.report.statuses.iter().enumerate() {
+            let include = match status {
+                RowStatus::Ok => true,
+                RowStatus::Duplicate => !loaded.dedupe,
+                _ => false,
+            };
+            if !include {
+                continue;
+            }
+            let row = &loaded.table.rows[i];
+            recipients.push(CampaignRecipient {
+                index: i,
+                email: row.get(email_col).cloned().unwrap_or_default(),
+                context: mapping::build_context(&loaded.table, row, &loaded.mapping),
+            });
+        }
+        if recipients.is_empty() {
+            return Err("No valid recipients to send to.".into());
+        }
+
+        let subject = self.template.subject.read(cx).value().to_string();
+        let body = self.template.body.read(cx).value().to_string();
+        if subject.trim().is_empty() && body.trim().is_empty() {
+            return Err("Write a subject or body in the Template step.".into());
+        }
+
+        let cfg = SendingConfig::default();
+        Ok(CampaignPlan {
+            account,
+            secret,
+            subject_template: subject,
+            body_template: body,
+            generate_text_alt: true,
+            messages_per_second: cfg.messages_per_second,
+            retry_limit: cfg.retry_limit,
+            stop_after_failures: cfg.stop_after_failures,
+            recipients,
+        })
+    }
+
+    fn on_send(&mut self, cx: &mut Context<Self>) {
+        match self.build_campaign_plan(cx) {
+            Ok(plan) => {
+                self.sending = true;
+                self.summary = None;
+                self.progress = None;
+                self.send_notice = None;
+                self.mail.command(Command::StartCampaign(Box::new(plan)));
+            }
+            Err(text) => self.send_notice = Some(Notice { ok: false, text }),
+        }
+        cx.notify();
+    }
+
+    fn on_cancel_send(&mut self, cx: &mut Context<Self>) {
+        self.mail.command(Command::CancelCampaign);
+        cx.notify();
+    }
+
+    fn start_again(&mut self, cx: &mut Context<Self>) {
+        self.summary = None;
+        self.progress = None;
+        self.send_notice = None;
+        cx.notify();
+    }
+
+    fn on_export_report(&mut self, cx: &mut Context<Self>) {
+        let dir = match &self.recipients {
+            RecipientsState::Loaded(l) => l
+                .path
+                .parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| std::env::current_dir().unwrap_or_default()),
+            _ => std::env::current_dir().unwrap_or_default(),
+        };
+        let receiver = cx.prompt_for_new_path(&dir, Some("outcome-report.csv"));
+        cx.spawn(async move |this, cx| {
+            if let Ok(Ok(Some(path))) = receiver.await {
+                let _ = this.update(cx, |this, cx| {
+                    this.mail.command(Command::ExportReport { path });
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    // ---- Send UI --------------------------------------------------------
+
+    fn render_send(&self, cx: &mut Context<Self>) -> AnyElement {
+        if self.sending {
+            self.render_progress(cx).into_any_element()
+        } else if let Some(summary) = &self.summary {
+            self.render_finished(summary, cx).into_any_element()
+        } else {
+            self.render_preflight(cx).into_any_element()
+        }
+    }
+
+    fn render_account_picker(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let active = self.active_account_id();
+        let mut chips = Vec::new();
+        for account in &self.store.accounts {
+            let id = account.id.clone();
+            let selected = active.as_deref() == Some(id.as_str());
+            chips.push(
+                Button::new(SharedString::from(format!("send-acct-{id}")))
+                    .label(account.display.clone())
+                    .selected(selected)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.selected_account = Some(id.clone());
+                        cx.notify();
+                    })),
+            );
+        }
+        v_flex()
+            .gap_1()
+            .child(field_label("Sending account", cx))
+            .child(h_flex().gap_2().flex_wrap().children(chips))
+    }
+
+    fn render_preflight(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let account_label = self
+            .active_account_id()
+            .and_then(|id| self.store.get(&id).map(|a| a.display.clone()))
+            .unwrap_or_else(|| "— none —".to_string());
+        let subject = self.template.subject.read(cx).value().to_string();
+        let subject = if subject.trim().is_empty() {
+            "(empty)".to_string()
+        } else {
+            subject
+        };
+        let sendable = self.sendable_count();
+        let mps = SendingConfig::default().messages_per_second.max(1.0);
+        let eta_secs = (sendable as f32 / mps).ceil() as u64;
+
+        let mut warnings: Vec<String> = Vec::new();
+        if self.store.accounts.is_empty() {
+            warnings.push("No sending account — add one in the Accounts step.".into());
+        }
+        match &self.recipients {
+            RecipientsState::Loaded(l) => {
+                if sendable == 0 {
+                    warnings.push("No valid recipients to send to.".into());
+                }
+                let flagged = l.report.invalid_email + l.report.missing_fields;
+                if flagged > 0 {
+                    warnings.push(format!("{flagged} rows will be skipped (bad email or missing data)."));
+                }
+                if l.dedupe && l.report.duplicates > 0 {
+                    warnings.push(format!(
+                        "{} duplicate rows will be skipped (de-dupe is on).",
+                        l.report.duplicates
+                    ));
+                }
+            }
+            _ => warnings.push("No recipient list loaded — add one in the Recipients step.".into()),
+        }
+
+        let can_send = !self.store.accounts.is_empty() && sendable > 0;
+
+        v_flex()
+            .gap_4()
+            .max_w(px(620.))
+            .child(self.render_account_picker(cx))
+            .child(
+                v_flex()
+                    .gap_2()
+                    .p_4()
+                    .rounded(cx.theme().radius)
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .child(summary_row("Account", account_label, cx))
+                    .child(summary_row("Subject", subject, cx))
+                    .child(summary_row(
+                        "Recipients",
+                        format!("{sendable} will be sent"),
+                        cx,
+                    ))
+                    .child(summary_row(
+                        "Est. duration",
+                        format!("~{}", format_duration(eta_secs)),
+                        cx,
+                    )),
+            )
+            .when(!warnings.is_empty(), |this| {
+                this.child(
+                    v_flex().gap_1().children(warnings.into_iter().map(|w| {
+                        div()
+                            .text_sm()
+                            .text_color(cx.theme().warning)
+                            .child(format!("⚠ {w}"))
+                    })),
+                )
+            })
+            .when_some(self.send_notice.clone(), |this, notice| {
+                let color = if notice.ok {
+                    cx.theme().success
+                } else {
+                    cx.theme().danger
+                };
+                this.child(div().text_sm().text_color(color).child(notice.text))
+            })
+            .child(
+                Button::new("send-campaign")
+                    .primary()
+                    .icon(IconName::ArrowRight)
+                    .label(format!("Send {sendable} emails"))
+                    .disabled(!can_send)
+                    .on_click(cx.listener(|this, _, _, cx| this.on_send(cx))),
+            )
+    }
+
+    fn render_progress(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let p = self.progress.clone().unwrap_or(CampaignProgress {
+            sent: 0,
+            failed: 0,
+            skipped: 0,
+            total: self.sendable_count(),
+            rate_per_sec: 0.0,
+            eta_secs: None,
+            recent: Vec::new(),
+            state: CampaignState::Running,
+        });
+        let processed = p.sent + p.failed + p.skipped;
+        let percentage = if p.total == 0 {
             0.0
         } else {
-            done as f32 / total as f32 * 100.0
+            processed as f32 / p.total as f32 * 100.0
         };
+        let eta = p
+            .eta_secs
+            .map(|s| format!("~{} left", format_duration(s)))
+            .unwrap_or_else(|| "estimating…".to_string());
 
         v_flex()
             .gap_3()
-            .mt_4()
-            .p_4()
-            .max_w(px(560.))
-            .rounded(cx.theme().radius)
-            .border_1()
-            .border_color(cx.theme().border)
-            .child(div().text_sm().child("Engine bridge demo (M0)"))
+            .max_w(px(720.))
             .child(Progress::new().value(percentage))
             .child(
-                div()
-                    .text_sm()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(status),
+                h_flex()
+                    .gap_5()
+                    .flex_wrap()
+                    .child(stat("Sent", p.sent, cx.theme().success))
+                    .child(stat("Failed", p.failed, cx.theme().danger))
+                    .child(stat("Skipped", p.skipped, cx.theme().warning))
+                    .child(stat("Total", p.total, cx.theme().foreground))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(format!("{:.0}/s · {eta}", p.rate_per_sec)),
+                    ),
             )
+            .child(self.render_recent_rows(&p.recent, cx))
+            .child(
+                v_flex()
+                    .gap_1()
+                    .child(
+                        Button::new("cancel-campaign")
+                            .danger()
+                            .label("Cancel")
+                            .on_click(cx.listener(|this, _, _, cx| this.on_cancel_send(cx))),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child("Cancel stops upcoming emails; those already delivered stay delivered."),
+                    ),
+            )
+    }
+
+    fn render_finished(&self, summary: &CampaignSummary, cx: &mut Context<Self>) -> impl IntoElement {
+        let (headline, color) = match &summary.state {
+            CampaignState::Completed => ("Campaign complete".to_string(), cx.theme().success),
+            CampaignState::Cancelled => ("Campaign cancelled".to_string(), cx.theme().warning),
+            CampaignState::Stopped(reason) => (format!("Stopped — {reason}"), cx.theme().danger),
+            CampaignState::Running => ("Finishing…".to_string(), cx.theme().foreground),
+        };
+        let recent = self
+            .progress
+            .as_ref()
+            .map(|p| p.recent.clone())
+            .unwrap_or_default();
+
+        v_flex()
+            .gap_4()
+            .max_w(px(720.))
+            .child(div().text_lg().text_color(color).child(headline))
+            .child(
+                h_flex()
+                    .gap_5()
+                    .flex_wrap()
+                    .child(stat("Sent", summary.sent, cx.theme().success))
+                    .child(stat("Failed", summary.failed, cx.theme().danger))
+                    .child(stat("Skipped", summary.skipped, cx.theme().warning))
+                    .child(stat("Total", summary.total, cx.theme().foreground))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(format!("in {}", format_duration(summary.elapsed_secs))),
+                    ),
+            )
+            .child(self.render_recent_rows(&recent, cx))
+            .when_some(self.send_notice.clone(), |this, notice| {
+                let color = if notice.ok {
+                    cx.theme().success
+                } else {
+                    cx.theme().danger
+                };
+                this.child(div().text_sm().text_color(color).child(notice.text))
+            })
             .child(
                 h_flex()
                     .gap_2()
-                    .when(!running, |this| {
-                        this.child(
-                            Button::new("start-dummy")
-                                .primary()
-                                .label("Simulate sending 200 emails")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.job = JobState::Running {
-                                        done: 0,
-                                        total: 200,
-                                    };
-                                    this.mail.command(Command::StartDummyJob { total: 200 });
-                                    cx.notify();
-                                })),
-                        )
-                    })
-                    .when(running, |this| {
-                        this.child(Button::new("cancel-dummy").label("Cancel").on_click(
-                            cx.listener(|this, _, _, _| {
-                                this.mail.command(Command::CancelJob);
-                            }),
-                        ))
-                    }),
+                    .child(
+                        Button::new("export-report")
+                            .outline()
+                            .icon(IconName::ArrowDown)
+                            .label("Export report (CSV)")
+                            .on_click(cx.listener(|this, _, _, cx| this.on_export_report(cx))),
+                    )
+                    .child(
+                        Button::new("send-again")
+                            .ghost()
+                            .label("Back to pre-flight")
+                            .on_click(cx.listener(|this, _, _, cx| this.start_again(cx))),
+                    ),
             )
+    }
+
+    fn render_recent_rows(&self, recent: &[RowOutcome], cx: &mut Context<Self>) -> impl IntoElement {
+        let rows = recent.iter().take(12).map(|o| {
+            let (color, label) = outcome_style(&o.status, cx);
+            h_flex()
+                .w_full()
+                .px_2()
+                .py_1()
+                .gap_2()
+                .border_b_1()
+                .border_color(cx.theme().border)
+                .child(div().w(px(72.)).text_xs().text_color(color).child(label))
+                .child(div().flex_1().text_sm().truncate().child(o.email.clone()))
+                .child(
+                    div()
+                        .flex_1()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .truncate()
+                        .child(o.error.clone().unwrap_or_default()),
+                )
+        });
+
+        v_flex()
+            .rounded(cx.theme().radius)
+            .border_1()
+            .border_color(cx.theme().border)
+            .overflow_hidden()
+            .child(
+                div()
+                    .px_2()
+                    .py_1()
+                    .bg(cx.theme().secondary)
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child("Recent activity"),
+            )
+            .children(rows)
+    }
+
+    // ---- Project files (M5) ---------------------------------------------
+
+    /// A snapshot of the persistable campaign state, for dirty comparison.
+    fn current_snapshot(&self, cx: &App) -> ProjectSnapshot {
+        let (source_path, sheet, email_column, mapping, dedupe) = match &self.recipients {
+            RecipientsState::Loaded(l) => (
+                Some(l.path.to_string_lossy().to_string()),
+                l.sheet.clone(),
+                l.table.headers.get(l.email_col).cloned(),
+                l.mapping.clone(),
+                l.dedupe,
+            ),
+            _ => (None, None, None, BTreeMap::new(), true),
+        };
+        ProjectSnapshot {
+            subject: self.template.subject.read(cx).value().to_string(),
+            body: self.template.body.read(cx).value().to_string(),
+            account: self.selected_account.clone(),
+            source_path,
+            sheet,
+            email_column,
+            mapping,
+            dedupe,
+        }
+    }
+
+    fn is_dirty(&self, cx: &App) -> bool {
+        self.current_snapshot(cx) != self.saved_snapshot
+    }
+
+    /// Adopt the current state as the saved baseline (call after save/load).
+    fn mark_saved(&mut self, cx: &App) {
+        self.saved_snapshot = self.current_snapshot(cx);
+    }
+
+    fn on_new(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.guarded(PendingAction::New, window, cx);
+    }
+
+    fn on_open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.guarded(PendingAction::OpenDialog, window, cx);
+    }
+
+    fn open_recent(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        self.guarded(PendingAction::OpenPath(path), window, cx);
+    }
+
+    /// Run `action` now, or after confirming discard when there are unsaved changes.
+    fn guarded(&mut self, action: PendingAction, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.is_dirty(cx) {
+            self.perform(action, window, cx);
+            return;
+        }
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            "Discard unsaved changes?",
+            Some("Your current campaign has changes that haven't been saved."),
+            &["Discard changes", "Cancel"],
+            cx,
+        );
+        cx.spawn_in(window, async move |this, cx| {
+            if let Ok(0) = answer.await {
+                let _ = this.update_in(cx, |this, window, cx| this.perform(action, window, cx));
+            }
+        })
+        .detach();
+    }
+
+    fn perform(&mut self, action: PendingAction, window: &mut Window, cx: &mut Context<Self>) {
+        match action {
+            PendingAction::New => self.do_new(window, cx),
+            PendingAction::OpenDialog => self.open_dialog(window, cx),
+            PendingAction::OpenPath(path) => self.load_project(path, window, cx),
+        }
+    }
+
+    fn do_new(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.template
+            .subject
+            .update(cx, |s, cx| s.set_value("", window, cx));
+        self.template
+            .body
+            .update(cx, |s, cx| s.set_value("", window, cx));
+        self.selected_account = None;
+        self.recipients = RecipientsState::Empty;
+        self.preview_row = 0;
+        self.sending = false;
+        self.progress = None;
+        self.summary = None;
+        self.send_notice = None;
+        self.project_path = None;
+        self.project_name = "Untitled campaign".into();
+        self.project_notice = None;
+        self.mark_saved(cx);
+        cx.notify();
+    }
+
+    fn open_dialog(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        let paths = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Open campaign project".into()),
+        });
+        cx.spawn_in(_window, async move |this, cx| {
+            let selected = match paths.await {
+                Ok(Ok(Some(paths))) => paths.into_iter().next(),
+                _ => None,
+            };
+            if let Some(path) = selected {
+                let _ = this.update_in(cx, |this, window, cx| this.load_project(path, window, cx));
+            }
+        })
+        .detach();
+    }
+
+    fn load_project(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        let project = match Project::load(&path) {
+            Ok(p) => p,
+            Err(e) => {
+                self.project_notice = Some(Notice {
+                    ok: false,
+                    text: format!("Could not open project: {e}"),
+                });
+                cx.notify();
+                return;
+            }
+        };
+        let dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
+
+        // Subject + body (body lives in the sibling HTML file).
+        self.template
+            .subject
+            .update(cx, |s, cx| s.set_value(project.template.subject.clone(), window, cx));
+        let html_full = resolve(&dir, &project.template.html_path);
+        let body = std::fs::read_to_string(&html_full).unwrap_or_default();
+        self.template
+            .body
+            .update(cx, |s, cx| s.set_value(body, window, cx));
+
+        self.selected_account = project.account.as_ref().map(|a| a.id.clone());
+        self.project_path = Some(path.clone());
+        self.project_name = project.name.clone();
+        self.sending = false;
+        self.progress = None;
+        self.summary = None;
+        self.send_notice = None;
+        self.project_notice = Some(Notice {
+            ok: true,
+            text: format!("Opened {}", path.display()),
+        });
+
+        self.recents.push(&path);
+        let _ = self.recents.save();
+
+        match &project.recipients {
+            Some(source) => {
+                let src = resolve(&dir, &source.source_path);
+                let preset = Some((source.email_column.clone(), source.mapping.clone()));
+                self.spawn_parse(src, source.sheet.clone(), preset, true, cx);
+            }
+            None => {
+                self.recipients = RecipientsState::Empty;
+            }
+        }
+
+        self.mark_saved(cx);
+        cx.notify();
+    }
+
+    fn on_save(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match self.project_path.clone() {
+            Some(path) => self.write_project(path, cx),
+            None => self.on_save_as(window, cx),
+        }
+    }
+
+    fn on_save_as(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        let dir = self
+            .project_path
+            .as_ref()
+            .and_then(|p| p.parent().map(Path::to_path_buf))
+            .or_else(|| match &self.recipients {
+                RecipientsState::Loaded(l) => l.path.parent().map(Path::to_path_buf),
+                _ => None,
+            })
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+        let suggested = format!("campaign{PROJECT_SUFFIX}");
+        let receiver = cx.prompt_for_new_path(&dir, Some(&suggested));
+        cx.spawn(async move |this, cx| {
+            if let Ok(Ok(Some(path))) = receiver.await {
+                let _ = this.update(cx, |this, cx| this.write_project(path, cx));
+            }
+        })
+        .detach();
+    }
+
+    fn write_project(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        let dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
+        let base = base_name(&path);
+        let html_file = format!("{base}.html");
+
+        // Body → sibling HTML file (keeps the TOML clean).
+        let body = self.template.body.read(cx).value().to_string();
+        if let Err(e) = std::fs::write(dir.join(&html_file), &body) {
+            self.project_notice = Some(Notice {
+                ok: false,
+                text: format!("Could not write template file: {e}"),
+            });
+            cx.notify();
+            return;
+        }
+
+        let account = self
+            .selected_account
+            .as_ref()
+            .and_then(|id| self.store.get(id))
+            .map(|a| AccountRef {
+                id: a.id.clone(),
+                display: a.display.clone(),
+            });
+        let recipients = match &self.recipients {
+            RecipientsState::Loaded(l) => Some(RecipientSource {
+                source_path: relative_or_absolute(&dir, &l.path),
+                sheet: l.sheet.clone(),
+                email_column: l.table.headers.get(l.email_col).cloned().unwrap_or_default(),
+                mapping: l.mapping.clone(),
+            }),
+            _ => None,
+        };
+
+        let project = Project {
+            version: CURRENT_VERSION,
+            name: base.clone(),
+            account,
+            template: TemplateSpec {
+                subject: self.template.subject.read(cx).value().to_string(),
+                html_path: html_file,
+                generate_text_alt: true,
+            },
+            recipients,
+            sending: SendingConfig::default(),
+        };
+
+        if let Err(e) = project.save(&path) {
+            self.project_notice = Some(Notice {
+                ok: false,
+                text: format!("Could not save project: {e}"),
+            });
+            cx.notify();
+            return;
+        }
+
+        self.project_path = Some(path.clone());
+        self.project_name = base;
+        self.recents.push(&path);
+        let _ = self.recents.save();
+        self.mark_saved(cx);
+        self.project_notice = Some(Notice {
+            ok: true,
+            text: "Project saved.".into(),
+        });
+        cx.notify();
+    }
+
+    fn render_topbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let dirty = self.is_dirty(cx);
+        v_flex()
+            .w_full()
+            .border_b_1()
+            .border_color(cx.theme().border)
+            .bg(cx.theme().secondary)
+            .child(
+                h_flex()
+                    .w_full()
+                    .items_center()
+                    .justify_between()
+                    .px_4()
+                    .py_2()
+                    .gap_3()
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .items_center()
+                            .child(div().text_sm().child(self.project_name.clone()))
+                            .when(dirty, |this| {
+                                this.child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(cx.theme().warning)
+                                        .child("• unsaved"),
+                                )
+                            })
+                            .when_some(self.project_notice.clone(), |this, notice| {
+                                let color = if notice.ok {
+                                    cx.theme().muted_foreground
+                                } else {
+                                    cx.theme().danger
+                                };
+                                this.child(div().text_xs().text_color(color).child(notice.text))
+                            }),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .child(
+                                Button::new("proj-new")
+                                    .ghost()
+                                    .label("New")
+                                    .on_click(cx.listener(|this, _, window, cx| this.on_new(window, cx))),
+                            )
+                            .child(
+                                Button::new("proj-open")
+                                    .ghost()
+                                    .label("Open")
+                                    .on_click(cx.listener(|this, _, window, cx| this.on_open(window, cx))),
+                            )
+                            .child(
+                                Button::new("proj-save")
+                                    .primary()
+                                    .label("Save")
+                                    .on_click(cx.listener(|this, _, window, cx| this.on_save(window, cx))),
+                            )
+                            .child(
+                                Button::new("proj-save-as")
+                                    .ghost()
+                                    .label("Save As")
+                                    .on_click(cx.listener(|this, _, window, cx| this.on_save_as(window, cx))),
+                            ),
+                    ),
+            )
+            .when(!self.recents.paths.is_empty(), |this| {
+                this.child(self.render_recents_row(cx))
+            })
+    }
+
+    fn render_recents_row(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let mut chips = Vec::new();
+        for (i, entry) in self.recents.paths.iter().take(6).enumerate() {
+            let path = PathBuf::from(entry);
+            let label = base_name(&path);
+            chips.push(
+                Button::new(SharedString::from(format!("recent-{i}")))
+                    .ghost()
+                    .label(label)
+                    .tooltip(SharedString::from(entry.clone()))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.open_recent(path.clone(), window, cx)
+                    })),
+            );
+        }
+        h_flex()
+            .w_full()
+            .items_center()
+            .gap_2()
+            .px_4()
+            .pb_2()
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child("Recent"),
+            )
+            .children(chips)
+    }
+}
+
+/// The campaign base name from a project path: strips the `.mmproj.toml`
+/// suffix, else falls back to the file stem.
+fn base_name(path: &Path) -> String {
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("campaign");
+    if let Some(stripped) = name.strip_suffix(PROJECT_SUFFIX) {
+        stripped.to_string()
+    } else {
+        path.file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("campaign")
+            .to_string()
+    }
+}
+
+/// Resolve a stored path against the project directory (absolute paths as-is).
+fn resolve(dir: &Path, stored: &str) -> PathBuf {
+    let p = Path::new(stored);
+    if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        dir.join(p)
+    }
+}
+
+/// Store `file` relative to `dir` when they share a directory, else absolute —
+/// so projects kept next to their data stay portable.
+fn relative_or_absolute(dir: &Path, file: &Path) -> String {
+    match file.file_name() {
+        Some(name) if file.parent() == Some(dir) => name.to_string_lossy().to_string(),
+        _ => file.to_string_lossy().to_string(),
     }
 }
 
@@ -1327,6 +2300,41 @@ fn status_style(status: &RowStatus, cx: &App) -> (Hsla, SharedString) {
         RowStatus::InvalidEmail => (theme.danger, "Bad email".into()),
         RowStatus::Duplicate => (theme.warning, "Duplicate".into()),
         RowStatus::MissingFields(_) => (theme.danger, "Missing".into()),
+    }
+}
+
+fn outcome_style(status: &OutcomeStatus, cx: &App) -> (Hsla, SharedString) {
+    let theme = cx.theme();
+    match status {
+        OutcomeStatus::Sent => (theme.success, "sent".into()),
+        OutcomeStatus::Failed => (theme.danger, "failed".into()),
+        OutcomeStatus::Skipped => (theme.warning, "skipped".into()),
+    }
+}
+
+/// A "Label   value" line for the pre-flight summary card.
+fn summary_row(label: &'static str, value: String, cx: &Context<MainWindow>) -> impl IntoElement {
+    h_flex()
+        .gap_3()
+        .items_baseline()
+        .child(
+            div()
+                .w(px(110.))
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child(label),
+        )
+        .child(div().flex_1().text_sm().truncate().child(value))
+}
+
+/// Human-readable duration like "45s", "3m 20s", "1h 5m".
+fn format_duration(secs: u64) -> String {
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m {}s", secs / 60, secs % 60)
+    } else {
+        format!("{}h {}m", secs / 3600, (secs % 3600) / 60)
     }
 }
 
@@ -1380,12 +2388,18 @@ fn region_button(
 }
 
 impl Render for MainWindow {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        h_flex()
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex()
             .size_full()
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
-            .child(self.render_sidebar(cx))
-            .child(self.render_content(cx))
+            .child(self.render_topbar(cx))
+            .child(
+                h_flex()
+                    .flex_1()
+                    .min_h(px(0.))
+                    .child(self.render_sidebar(cx))
+                    .child(self.render_content(window, cx)),
+            )
     }
 }

@@ -32,6 +32,23 @@ pub fn auto_map(fields: &[String], columns: &[String]) -> BTreeMap<String, Strin
     mapping
 }
 
+/// Build a `template field -> value` context for one row using the mapping.
+/// Fields whose mapped column is missing from the table are skipped.
+pub fn build_context(
+    table: &RecipientTable,
+    row: &[String],
+    mapping: &BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
+    mapping
+        .iter()
+        .filter_map(|(field, column)| {
+            let idx = table.column_index(column)?;
+            let value = row.get(idx)?;
+            Some((field.clone(), value.clone()))
+        })
+        .collect()
+}
+
 /// Outcome of validating a single recipient row. Each row falls into exactly
 /// one bucket (checked in this order: email, duplicate, missing fields).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -206,6 +223,18 @@ mod tests {
         );
         assert_eq!(report.sendable(), 1);
         assert_eq!(report.sendable_with_duplicates(), 2);
+    }
+
+    #[test]
+    fn builds_context_from_mapping() {
+        let t = table(&["Email", "First Name"], &[&["a@x.com", "Ada"]]);
+        let mapping: BTreeMap<String, String> =
+            [("first_name".to_string(), "First Name".to_string())]
+                .into_iter()
+                .collect();
+        let context = build_context(&t, &t.rows[0], &mapping);
+        assert_eq!(context.get("first_name"), Some(&"Ada".to_string()));
+        assert_eq!(context.len(), 1);
     }
 
     #[test]
