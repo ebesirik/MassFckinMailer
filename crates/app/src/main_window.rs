@@ -32,6 +32,11 @@ const LANGUAGES: &[(&str, &str)] = &[
     ("fr", "FR"),
     ("it", "IT"),
     ("pt", "PT"),
+    ("ru", "RU"),
+    ("zh", "中"),
+    ("ja", "日"),
+    ("nl", "NL"),
+    ("pl", "PL"),
 ];
 
 /// Translate a key with the current locale (no interpolation).

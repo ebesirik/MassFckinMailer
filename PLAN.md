@@ -1,6 +1,8 @@
-# MassFckinMailer — Design & Implementation Plan
+# MassFckinMailer — Design & Rationale
 
 Cross-platform desktop mass mailer. Rust + gpui + gpui-component. Non-blocking, smooth, lightweight.
+
+The app is fully implemented; this document is the design record — the architecture and the reasoning behind the key decisions. For build/run/convention notes see `CLAUDE.md` and `README.md`.
 
 ## 1. Confirmed decisions
 
@@ -137,7 +139,7 @@ State machine per campaign: `Idle → Validating → Running → (Completed | Ca
 - **Cancel**: token checked between sends; in-flight requests aborted; already-sent stays sent — UI copy must say "Cancel stops upcoming emails; X already delivered".
 - Progress events: `{sent, failed, skipped, retrying, total, rate, eta}` + per-row status ring buffer for the live table.
 - Outcome report: per-row status exportable as CSV (email, status, error, timestamp, provider message-id).
-- **Resume**: a campaign outcome report can be re-loaded to re-run only failed/cancelled rows (planned — M7). Report format is designed for this from day one: keep the original row index + all mapped fields so resume needs no re-mapping.
+- **Resume**: a campaign outcome report can be re-loaded to re-run only failed/cancelled rows. The report format is designed for this: it keeps the original row index so resume needs no re-mapping.
 
 ## 10. UI flow
 
@@ -150,23 +152,7 @@ Left rail with four steps, acting as both nav and checklist (steps show ✓/! st
 
 Project menu: New / Open / Save / Recent. Dirty-state tracking with save prompt. First-run empty states explain each step (the "help" requirement, kept lightweight).
 
-## 11. Milestones
-
-| # | Milestone | Contents |
-|---|---|---|
-| M0 | Skeleton | Workspace, gpui window, nav rail, theme, tokio bridge thread + channel plumbing proven with a dummy async task |
-| M1 | Accounts | Account model, keychain storage, SMTP + Mailgun impls, add-account UI, Test connection |
-| M2 | Recipients | CSV/XLSX import, email detection, mapping UI, validation, virtualized preview table |
-| M3 | Template | Editor + preview, minijinja rendering, placeholder extraction, sample-row preview |
-| M4 | Send engine | Queue/workers/throttle/retry/cancel, progress UI, outcome report export — **end-to-end usable via SMTP/Mailgun** |
-| M5 | Project files | TOML save/load, recent projects, dirty tracking |
-| M6 | SES + OAuth providers | aws-sdk-sesv2; Gmail/Outlook OAuth PKCE + token refresh in keychain |
-| M7 | Resume | Re-run failed/cancelled rows from an outcome report |
-| M8 | Polish | Empty-state help, error message pass, packaging (msi/dmg/AppImage), app icon |
-
-M1–M4 order front-loads risk: the tokio↔gpui bridge and the send engine are the novel parts; SES/OAuth are additive.
-
-## 12. Risks & mitigations
+## 11. Risks & mitigations
 
 - **gpui is pre-1.0**: pin exact versions of `gpui`/`gpui-component`; upgrade deliberately.
 - **Gmail/Outlook OAuth friction**: users must register their own OAuth app; mitigate with step-by-step in-app instructions. Fallback: app-password SMTP works day one.
@@ -174,9 +160,9 @@ M1–M4 order front-loads risk: the tokio↔gpui bridge and the send engine are 
 - **WebView (wry) weight**: keep behind a feature flag; native simple-HTML preview is the lightweight default.
 - **Huge lists**: streaming parse + virtualized table + bounded channels; never hold rendered emails for all rows in memory.
 
-## 13. Resolved scope decisions
+## 12. Resolved scope decisions
 
 - **Attachments**: deferred — revisit when we can attach *and* preview them in the mail body (all providers support them, so it's purely additive).
 - **Per-recipient BCC/CC columns**: out of scope for v1.
-- **Resume from outcome report**: in scope — M7.
+- **Resume from outcome report**: in scope.
 - **Unsubscribe-link / List-Unsubscribe header**: skipped for v1 (uneven support across account types).
