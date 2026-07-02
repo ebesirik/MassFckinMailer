@@ -26,6 +26,9 @@ impl Account {
         match self.config {
             AccountConfig::Smtp(_) => ProviderKind::Smtp,
             AccountConfig::Mailgun(_) => ProviderKind::Mailgun,
+            AccountConfig::Ses(_) => ProviderKind::Ses,
+            AccountConfig::Gmail(_) => ProviderKind::Gmail,
+            AccountConfig::Outlook(_) => ProviderKind::Outlook,
         }
     }
 }
@@ -37,6 +40,9 @@ impl Account {
 pub enum AccountConfig {
     Smtp(SmtpConfig),
     Mailgun(MailgunConfig),
+    Ses(SesConfig),
+    Gmail(GmailConfig),
+    Outlook(OutlookConfig),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -92,6 +98,41 @@ pub struct MailgunConfig {
 
 fn default_region() -> MailgunRegion {
     MailgunRegion::Us
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SesConfig {
+    /// AWS region, e.g. `us-east-1`.
+    pub region: String,
+    /// `From:` address (must be a verified SES identity).
+    pub from: String,
+    // Access key id + secret access key live in the keychain (two lines).
+}
+
+/// Gmail via OAuth. The user registers their own Google Cloud OAuth client.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GmailConfig {
+    pub client_id: String,
+    /// The authenticated Gmail address (used as `From:`).
+    pub from: String,
+    // client secret + OAuth tokens live in the keychain (JSON).
+}
+
+/// Outlook/Microsoft 365 via OAuth (Microsoft Graph). The user registers their
+/// own Azure app.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OutlookConfig {
+    pub client_id: String,
+    /// Azure tenant (`common`, `organizations`, or a tenant id).
+    #[serde(default = "default_tenant")]
+    pub tenant: String,
+    /// The authenticated address (used as `From:`).
+    pub from: String,
+    // OAuth tokens live in the keychain (JSON).
+}
+
+fn default_tenant() -> String {
+    "common".to_string()
 }
 
 /// The on-disk accounts file: a flat list of accounts.
@@ -204,14 +245,26 @@ mod tests {
         }
     }
 
+    fn ses_account() -> Account {
+        Account {
+            id: "acct_3".into(),
+            display: "SES us-east-1".into(),
+            config: AccountConfig::Ses(SesConfig {
+                region: "us-east-1".into(),
+                from: "hello@example.com".into(),
+            }),
+        }
+    }
+
     #[test]
     fn store_toml_round_trip() {
         let store = AccountStore {
-            accounts: vec![smtp_account(), mailgun_account()],
+            accounts: vec![smtp_account(), mailgun_account(), ses_account()],
         };
         let text = toml::to_string_pretty(&store).unwrap();
         let parsed: AccountStore = toml::from_str(&text).unwrap();
         assert_eq!(store, parsed);
+        assert_eq!(parsed.accounts[2].kind(), ProviderKind::Ses);
     }
 
     #[test]

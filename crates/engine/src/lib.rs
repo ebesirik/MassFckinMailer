@@ -34,6 +34,13 @@ pub enum Command {
     /// `secret` is the keychain value (SMTP password / API key) supplied by the
     /// caller so the engine needn't touch the keychain.
     TestAccount { account: Account, secret: String },
+    /// Run the interactive OAuth flow for an account (opens the browser) and,
+    /// on success, store its tokens in the keychain. `client_secret` is empty
+    /// for public clients (e.g. Azure with PKCE).
+    ConnectOAuth {
+        account: Account,
+        client_secret: String,
+    },
     /// Start sending a campaign. Boxed because the plan (with all recipients)
     /// is large relative to the other variants.
     StartCampaign(Box<CampaignPlan>),
@@ -48,6 +55,13 @@ pub enum Command {
 pub enum Event {
     /// Result of a [`Command::TestAccount`], correlated by `account_id`.
     TestResult {
+        account_id: String,
+        ok: bool,
+        message: String,
+    },
+    /// Result of a [`Command::ConnectOAuth`]. On success the tokens are already
+    /// stored in the keychain.
+    OAuthConnected {
         account_id: String,
         ok: bool,
         message: String,
@@ -207,6 +221,12 @@ async fn run_loop(cmd_rx: flume::Receiver<Command>, evt_tx: flume::Sender<Event>
             Command::TestAccount { account, secret } => {
                 tokio::spawn(test_account(account, secret, evt_tx.clone()));
             }
+            Command::ConnectOAuth {
+                account,
+                client_secret,
+            } => {
+                tokio::spawn(connect_oauth(account, client_secret, evt_tx.clone()));
+            }
             Command::StartCampaign(plan) => {
                 if let Some(token) = current.take() {
                     token.cancel();
@@ -268,6 +288,24 @@ async fn run_loop(cmd_rx: flume::Receiver<Command>, evt_tx: flume::Sender<Event>
             }
         }
     }
+}
+
+async fn connect_oauth(account: Account, client_secret: String, events: flume::Sender<Event>) {
+    let account_id = account.id.clone();
+    let (ok, message) = match mmm_providers::oauth::connect(&account, &client_secret).await {
+        Ok(tokens) => match mmm_providers::oauth::store_tokens(&account.id, &tokens) {
+            Ok(()) => (true, "Connected and authorized.".to_string()),
+            Err(e) => (false, format!("Authorized, but could not store tokens: {e}")),
+        },
+        Err(e) => (false, e),
+    };
+    let _ = events
+        .send_async(Event::OAuthConnected {
+            account_id,
+            ok,
+            message,
+        })
+        .await;
 }
 
 async fn test_account(account: Account, secret: String, events: flume::Sender<Event>) {

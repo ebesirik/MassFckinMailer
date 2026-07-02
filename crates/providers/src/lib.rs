@@ -7,11 +7,18 @@ use tokio_util::sync::CancellationToken;
 
 pub mod account;
 pub mod factory;
+pub mod gmail;
 pub mod mailgun;
+pub mod oauth;
+pub mod outlook;
 pub mod secrets;
+pub mod ses;
 pub mod smtp;
 
-pub use account::{Account, AccountConfig, AccountStore, MailgunConfig, MailgunRegion, SmtpConfig, TlsMode};
+pub use account::{
+    Account, AccountConfig, AccountStore, GmailConfig, MailgunConfig, MailgunRegion, OutlookConfig,
+    SesConfig, SmtpConfig, TlsMode,
+};
 pub use factory::build_provider;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

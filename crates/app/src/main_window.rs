@@ -25,8 +25,8 @@ use mmm_engine::{
     Event, MailRuntime, OutcomeStatus, RowOutcome,
 };
 use mmm_providers::{
-    Account, AccountConfig, AccountStore, MailgunConfig, MailgunRegion, ProviderKind, SmtpConfig,
-    TlsMode, account::new_account_id, secrets,
+    Account, AccountConfig, AccountStore, GmailConfig, MailgunConfig, MailgunRegion, OutlookConfig,
+    ProviderKind, SesConfig, SmtpConfig, TlsMode, account::new_account_id, secrets,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -153,6 +153,14 @@ struct AccountForm {
     mg_domain: Entity<InputState>,
     mg_from: Entity<InputState>,
     mg_api_key: Entity<InputState>,
+    ses_region: Entity<InputState>,
+    ses_from: Entity<InputState>,
+    ses_key_id: Entity<InputState>,
+    ses_secret: Entity<InputState>,
+    oauth_client_id: Entity<InputState>,
+    oauth_client_secret: Entity<InputState>,
+    oauth_tenant: Entity<InputState>,
+    oauth_from: Entity<InputState>,
 }
 
 impl AccountForm {
@@ -181,6 +189,22 @@ impl AccountForm {
             mg_domain: mk(window, cx, "news.example.com", false),
             mg_from: mk(window, cx, "hello@news.example.com", false),
             mg_api_key: mk(window, cx, "Mailgun private API key", true),
+            ses_region: cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder("us-east-1")
+                    .default_value("us-east-1")
+            }),
+            ses_from: mk(window, cx, "verified@example.com", false),
+            ses_key_id: mk(window, cx, "AKIA… access key id", true),
+            ses_secret: mk(window, cx, "secret access key", true),
+            oauth_client_id: mk(window, cx, "OAuth client ID", false),
+            oauth_client_secret: mk(window, cx, "client secret (Google desktop apps)", true),
+            oauth_tenant: cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder("common")
+                    .default_value("common")
+            }),
+            oauth_from: mk(window, cx, "you@gmail.com", false),
         }
     }
 }
@@ -269,6 +293,8 @@ pub struct MainWindow {
     form: AccountForm,
     notice: Option<Notice>,
     testing: bool,
+    /// Account awaiting OAuth authorization; saved once connected.
+    pending_oauth: Option<Account>,
 
     // M2 — recipients + M3 template
     template: TemplateForm,
@@ -330,6 +356,7 @@ impl MainWindow {
             form,
             notice: None,
             testing: false,
+            pending_oauth: None,
             template,
             recipients: RecipientsState::Empty,
             preview_row: 0,
@@ -351,6 +378,32 @@ impl MainWindow {
             Event::TestResult { ok, message, .. } => {
                 self.testing = false;
                 self.notice = Some(Notice { ok, text: message });
+            }
+            Event::OAuthConnected {
+                account_id,
+                ok,
+                message,
+            } => {
+                self.testing = false;
+                if ok {
+                    if let Some(account) = self.pending_oauth.take()
+                        && account.id == account_id
+                    {
+                        self.store.upsert(account);
+                        if let Err(e) = self.store.save() {
+                            self.notice = Some(Notice {
+                                ok: false,
+                                text: format!("Connected, but saving the account failed: {e}"),
+                            });
+                            return;
+                        }
+                        self.form.open = false;
+                    }
+                    self.notice = Some(Notice { ok: true, text: message });
+                } else {
+                    self.pending_oauth = None;
+                    self.notice = Some(Notice { ok: false, text: message });
+                }
             }
             Event::CampaignProgress(progress) => {
                 self.progress = Some(progress);
@@ -440,7 +493,87 @@ impl MainWindow {
                     api_key,
                 ))
             }
-            other => Err(format!("{} accounts are not supported yet.", other.label())),
+            ProviderKind::Ses => {
+                let region = read_trimmed(&self.form.ses_region, cx);
+                let from = read_trimmed(&self.form.ses_from, cx);
+                let key_id = self.form.ses_key_id.read(cx).value().trim().to_string();
+                let secret = self.form.ses_secret.read(cx).value().trim().to_string();
+
+                if region.is_empty() {
+                    return Err("AWS region is required.".into());
+                }
+                if from.is_empty() {
+                    return Err("A verified From address is required.".into());
+                }
+                if key_id.is_empty() || secret.is_empty() {
+                    return Err("Both the access key id and secret access key are required.".into());
+                }
+                if display.is_empty() {
+                    display = format!("SES — {region}");
+                }
+
+                // Credentials are stored together in the keychain as two lines.
+                Ok((
+                    Account {
+                        id,
+                        display,
+                        config: AccountConfig::Ses(SesConfig { region, from }),
+                    },
+                    format!("{key_id}\n{secret}"),
+                ))
+            }
+            ProviderKind::Gmail => {
+                let client_id = read_trimmed(&self.form.oauth_client_id, cx);
+                let client_secret = self.form.oauth_client_secret.read(cx).value().trim().to_string();
+                let from = read_trimmed(&self.form.oauth_from, cx);
+                if client_id.is_empty() {
+                    return Err("OAuth client ID is required.".into());
+                }
+                if from.is_empty() {
+                    return Err("Your Gmail address (From) is required.".into());
+                }
+                if display.is_empty() {
+                    display = format!("Gmail — {from}");
+                }
+                // For OAuth accounts the returned secret is the client secret,
+                // consumed by the Connect flow (tokens are stored afterwards).
+                Ok((
+                    Account {
+                        id,
+                        display,
+                        config: AccountConfig::Gmail(GmailConfig { client_id, from }),
+                    },
+                    client_secret,
+                ))
+            }
+            ProviderKind::Outlook => {
+                let client_id = read_trimmed(&self.form.oauth_client_id, cx);
+                let tenant = read_trimmed(&self.form.oauth_tenant, cx);
+                let from = read_trimmed(&self.form.oauth_from, cx);
+                if client_id.is_empty() {
+                    return Err("Application (client) ID is required.".into());
+                }
+                if from.is_empty() {
+                    return Err("Your address (From) is required.".into());
+                }
+                if display.is_empty() {
+                    display = format!("Outlook — {from}");
+                }
+                let tenant = if tenant.is_empty() { "common".to_string() } else { tenant };
+                Ok((
+                    Account {
+                        id,
+                        display,
+                        config: AccountConfig::Outlook(OutlookConfig {
+                            client_id,
+                            tenant,
+                            from,
+                        }),
+                    },
+                    // Azure public client + PKCE: no client secret.
+                    String::new(),
+                ))
+            }
         }
     }
 
@@ -453,6 +586,23 @@ impl MainWindow {
                     text: "Testing connection…".into(),
                 });
                 self.mail.command(Command::TestAccount { account, secret });
+            }
+            Err(text) => self.notice = Some(Notice { ok: false, text }),
+        }
+        cx.notify();
+    }
+
+    fn on_connect_oauth(&mut self, cx: &mut Context<Self>) {
+        match self.form_to_account(new_account_id(), cx) {
+            Ok((account, client_secret)) => {
+                self.pending_oauth = Some(account.clone());
+                self.testing = true;
+                self.notice = Some(Notice {
+                    ok: true,
+                    text: "Opening your browser to authorize… complete sign-in there.".into(),
+                });
+                self.mail
+                    .command(Command::ConnectOAuth { account, client_secret });
             }
             Err(text) => self.notice = Some(Notice { ok: false, text }),
         }
@@ -803,6 +953,9 @@ impl MainWindow {
             let detail = match &account.config {
                 AccountConfig::Smtp(c) => format!("SMTP · {}:{}", c.host, c.port),
                 AccountConfig::Mailgun(c) => format!("Mailgun · {}", c.domain),
+                AccountConfig::Ses(c) => format!("AWS SES · {}", c.region),
+                AccountConfig::Gmail(c) => format!("Gmail · {}", c.from),
+                AccountConfig::Outlook(c) => format!("Outlook · {}", c.from),
             };
             h_flex()
                 .items_center()
@@ -839,6 +992,7 @@ impl MainWindow {
 
     fn render_account_form(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let kind = self.form.kind;
+        let is_oauth = matches!(kind, ProviderKind::Gmail | ProviderKind::Outlook);
 
         v_flex()
             .gap_4()
@@ -855,8 +1009,12 @@ impl MainWindow {
                     .child(
                         h_flex()
                             .gap_2()
+                            .flex_wrap()
                             .child(kind_button("k-smtp", "Generic SMTP", ProviderKind::Smtp, kind, cx))
-                            .child(kind_button("k-mailgun", "Mailgun", ProviderKind::Mailgun, kind, cx)),
+                            .child(kind_button("k-mailgun", "Mailgun", ProviderKind::Mailgun, kind, cx))
+                            .child(kind_button("k-ses", "AWS SES", ProviderKind::Ses, kind, cx))
+                            .child(kind_button("k-gmail", "Gmail", ProviderKind::Gmail, kind, cx))
+                            .child(kind_button("k-outlook", "Outlook", ProviderKind::Outlook, kind, cx)),
                     ),
             )
             .child(labeled("Display name (optional)", &self.form.display, cx))
@@ -865,6 +1023,15 @@ impl MainWindow {
             })
             .when(kind == ProviderKind::Mailgun, |this| {
                 this.child(self.render_mailgun_fields(cx))
+            })
+            .when(kind == ProviderKind::Ses, |this| {
+                this.child(self.render_ses_fields(cx))
+            })
+            .when(kind == ProviderKind::Gmail, |this| {
+                this.child(self.render_gmail_fields(cx))
+            })
+            .when(kind == ProviderKind::Outlook, |this| {
+                this.child(self.render_outlook_fields(cx))
             })
             .when_some(self.notice.clone(), |this, notice| {
                 let color = if notice.ok {
@@ -877,20 +1044,31 @@ impl MainWindow {
             .child(
                 h_flex()
                     .gap_2()
-                    .child(
-                        Button::new("test-conn")
-                            .outline()
-                            .label("Test connection")
-                            .disabled(self.testing)
-                            .on_click(cx.listener(|this, _, _, cx| this.on_test_connection(cx))),
-                    )
-                    .child(
-                        Button::new("save-account")
-                            .primary()
-                            .label("Save account")
-                            .disabled(self.testing)
-                            .on_click(cx.listener(|this, _, _, cx| this.on_save_account(cx))),
-                    )
+                    .when(!is_oauth, |this| {
+                        this.child(
+                            Button::new("test-conn")
+                                .outline()
+                                .label("Test connection")
+                                .disabled(self.testing)
+                                .on_click(cx.listener(|this, _, _, cx| this.on_test_connection(cx))),
+                        )
+                        .child(
+                            Button::new("save-account")
+                                .primary()
+                                .label("Save account")
+                                .disabled(self.testing)
+                                .on_click(cx.listener(|this, _, _, cx| this.on_save_account(cx))),
+                        )
+                    })
+                    .when(is_oauth, |this| {
+                        this.child(
+                            Button::new("connect-oauth")
+                                .primary()
+                                .label("Connect & authorize")
+                                .disabled(self.testing)
+                                .on_click(cx.listener(|this, _, _, cx| this.on_connect_oauth(cx))),
+                        )
+                    })
                     .child(
                         Button::new("cancel-account")
                             .ghost()
@@ -898,6 +1076,7 @@ impl MainWindow {
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.form.open = false;
                                 this.notice = None;
+                                this.pending_oauth = None;
                                 cx.notify();
                             })),
                     ),
@@ -953,6 +1132,68 @@ impl MainWindow {
             )
             .child(labeled("From address", &self.form.mg_from, cx))
             .child(labeled("API key", &self.form.mg_api_key, cx))
+    }
+
+    fn render_ses_fields(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex()
+            .gap_3()
+            .child(
+                h_flex()
+                    .gap_3()
+                    .child(
+                        div()
+                            .w(px(160.))
+                            .child(labeled("Region", &self.form.ses_region, cx)),
+                    )
+                    .child(div().flex_1().child(labeled("From address", &self.form.ses_from, cx))),
+            )
+            .child(labeled("Access key id", &self.form.ses_key_id, cx))
+            .child(labeled("Secret access key", &self.form.ses_secret, cx))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(
+                        "The From address must be a verified SES identity. New accounts are in \
+                         the sandbox — recipients must also be verified until you request production access.",
+                    ),
+            )
+    }
+
+    fn render_gmail_fields(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex()
+            .gap_3()
+            .child(labeled("From (your Gmail address)", &self.form.oauth_from, cx))
+            .child(labeled("OAuth client ID", &self.form.oauth_client_id, cx))
+            .child(labeled("Client secret", &self.form.oauth_client_secret, cx))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(
+                        "In Google Cloud: enable the Gmail API, create an OAuth client of type \
+                         \"Desktop app\", and paste its client ID + secret here. \"Connect\" opens \
+                         your browser to grant the gmail.send scope; personal Gmail caps at ~500/day.",
+                    ),
+            )
+    }
+
+    fn render_outlook_fields(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex()
+            .gap_3()
+            .child(labeled("From (your address)", &self.form.oauth_from, cx))
+            .child(labeled("Application (client) ID", &self.form.oauth_client_id, cx))
+            .child(labeled("Tenant (common / organizations / id)", &self.form.oauth_tenant, cx))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(
+                        "In Azure: register an app, add the delegated Mail.Send permission, and \
+                         under \"Mobile and desktop applications\" add redirect URI http://localhost. \
+                         No client secret is needed (public client + PKCE). \"Connect\" opens your browser.",
+                    ),
+            )
     }
 
     // ---- Template UI (M3) -----------------------------------------------
