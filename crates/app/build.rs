@@ -5,6 +5,17 @@ fn main() {
     // rerun hints — so watch them here to pick up translation edits.
     println!("cargo:rerun-if-changed=locales");
 
+    // Displayed version: CI sets MFM_VERSION (base version from Cargo.toml plus a
+    // channel/build suffix); local builds fall back to the crate version. Exposed
+    // to the app as env!("MFM_VERSION").
+    let version = std::env::var("MFM_VERSION")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .or_else(|| std::env::var("CARGO_PKG_VERSION").ok())
+        .unwrap_or_else(|| "0.0.0".to_string());
+    println!("cargo:rustc-env=MFM_VERSION={version}");
+    println!("cargo:rerun-if-env-changed=MFM_VERSION");
+
     #[cfg(windows)]
     {
         let icon = concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/icon.ico");

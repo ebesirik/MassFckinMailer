@@ -5,8 +5,9 @@ use std::rc::Rc;
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_component::{
-    ActiveTheme, Disableable as _, Icon, IconName, Selectable as _, Theme, ThemeMode, h_flex,
+    ActiveTheme, Disableable as _, Icon, IconName, Selectable as _, Theme, ThemeMode,
     button::{Button, ButtonVariants as _},
+    h_flex,
     input::{Input, InputState},
     progress::Progress,
     sidebar::{Sidebar, SidebarGroup, SidebarHeader, SidebarMenu, SidebarMenuItem},
@@ -43,6 +44,9 @@ const LANGUAGES: &[(&str, &str)] = &[
 fn tr(key: &str) -> String {
     t!(key).into_owned()
 }
+
+/// App version + build, embedded at compile time by `build.rs` (see `MFM_VERSION`).
+const APP_VERSION: &str = env!("MFM_VERSION");
 use mmm_engine::{
     CampaignPlan, CampaignProgress, CampaignRecipient, CampaignState, CampaignSummary, Command,
     Event, MailRuntime, OutcomeStatus, RowOutcome,
@@ -284,9 +288,7 @@ impl Loaded {
         let required: Vec<(String, usize)> = self
             .mapping
             .iter()
-            .filter_map(|(field, col)| {
-                self.table.column_index(col).map(|idx| (field.clone(), idx))
-            })
+            .filter_map(|(field, col)| self.table.column_index(col).map(|idx| (field.clone(), idx)))
             .collect();
         self.report = Rc::new(mapping::validate(&self.table, self.email_col, &required));
     }
@@ -397,12 +399,14 @@ impl MainWindow {
         });
 
         let sc = SendingConfig::default();
-        let send_mps =
-            cx.new(|cx| InputState::new(window, cx).default_value(sc.messages_per_second.to_string()));
+        let send_mps = cx.new(|cx| {
+            InputState::new(window, cx).default_value(sc.messages_per_second.to_string())
+        });
         let send_retry =
             cx.new(|cx| InputState::new(window, cx).default_value(sc.retry_limit.to_string()));
-        let send_stop =
-            cx.new(|cx| InputState::new(window, cx).default_value(sc.stop_after_failures.to_string()));
+        let send_stop = cx.new(|cx| {
+            InputState::new(window, cx).default_value(sc.stop_after_failures.to_string())
+        });
         let test_email = cx.new(|cx| InputState::new(window, cx).placeholder("you@example.com"));
 
         Self {
@@ -527,7 +531,10 @@ impl MainWindow {
                     });
                 } else {
                     self.pending_oauth = None;
-                    self.notice = Some(Notice { ok: false, text: message });
+                    self.notice = Some(Notice {
+                        ok: false,
+                        text: message,
+                    });
                 }
             }
             Event::CampaignProgress(progress) => {
@@ -647,7 +654,13 @@ impl MainWindow {
             }
             ProviderKind::Gmail => {
                 let client_id = read_trimmed(&self.form.oauth_client_id, cx);
-                let client_secret = self.form.oauth_client_secret.read(cx).value().trim().to_string();
+                let client_secret = self
+                    .form
+                    .oauth_client_secret
+                    .read(cx)
+                    .value()
+                    .trim()
+                    .to_string();
                 let from = read_trimmed(&self.form.oauth_from, cx);
                 if client_id.is_empty() {
                     return Err(tr("err.client_id"));
@@ -682,7 +695,11 @@ impl MainWindow {
                 if display.is_empty() {
                     display = format!("Outlook — {from}");
                 }
-                let tenant = if tenant.is_empty() { "common".to_string() } else { tenant };
+                let tenant = if tenant.is_empty() {
+                    "common".to_string()
+                } else {
+                    tenant
+                };
                 Ok((
                     Account {
                         id,
@@ -724,8 +741,10 @@ impl MainWindow {
                     ok: true,
                     text: tr("acct.connecting"),
                 });
-                self.mail
-                    .command(Command::ConnectOAuth { account, client_secret });
+                self.mail.command(Command::ConnectOAuth {
+                    account,
+                    client_secret,
+                });
             }
             Err(text) => self.notice = Some(Notice { ok: false, text }),
         }
@@ -863,8 +882,9 @@ impl MainWindow {
                 })
                 .await;
 
-            let _ = this
-                .update(cx, |this, cx| this.on_parsed(path, output, preset, from_load, cx));
+            let _ = this.update(cx, |this, cx| {
+                this.on_parsed(path, output, preset, from_load, cx)
+            });
         })
         .detach();
     }
@@ -884,9 +904,9 @@ impl MainWindow {
                 let fields = self.template_fields(cx);
                 let (email_col, mapping) = match &preset {
                     Some((email_column, mapping)) => {
-                        let col = table.column_index(email_column).unwrap_or_else(|| {
-                            import::detect_email_column_in(&table).unwrap_or(0)
-                        });
+                        let col = table
+                            .column_index(email_column)
+                            .unwrap_or_else(|| import::detect_email_column_in(&table).unwrap_or(0));
                         (col, mapping.clone())
                     }
                     None => (
@@ -991,12 +1011,18 @@ impl MainWindow {
                             .flex_1()
                             .overflow_hidden()
                             .child("MassFckinMailer")
-                            .child(div().text_xs().child(tr("nav.subtitle"))),
+                            .child(div().text_xs().child(tr("nav.subtitle")))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(format!("v{APP_VERSION}")),
+                            ),
                     ),
             )
             .child(
-                SidebarGroup::new("Steps").child(SidebarMenu::new().children(
-                    Section::ALL.map(|section| {
+                SidebarGroup::new("Steps").child(SidebarMenu::new().children(Section::ALL.map(
+                    |section| {
                         let status = self.step_status(section, cx);
                         let mut item = SidebarMenuItem::new(tr(section.label_key()))
                             .icon(section.icon())
@@ -1009,8 +1035,8 @@ impl MainWindow {
                             item = item.suffix(div().text_color(color).child(Icon::new(icon)));
                         }
                         item
-                    }),
-                )),
+                    },
+                ))),
             )
     }
 
@@ -1063,7 +1089,9 @@ impl MainWindow {
                     ),
                 )
             })
-            .when(self.form.open, |this| this.child(self.render_account_form(cx)))
+            .when(self.form.open, |this| {
+                this.child(self.render_account_form(cx))
+            })
     }
 
     fn render_account_list(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1138,11 +1166,41 @@ impl MainWindow {
                         h_flex()
                             .gap_2()
                             .flex_wrap()
-                            .child(kind_button("k-smtp", "provider.smtp", ProviderKind::Smtp, kind, cx))
-                            .child(kind_button("k-mailgun", "provider.mailgun", ProviderKind::Mailgun, kind, cx))
-                            .child(kind_button("k-ses", "provider.ses", ProviderKind::Ses, kind, cx))
-                            .child(kind_button("k-gmail", "provider.gmail", ProviderKind::Gmail, kind, cx))
-                            .child(kind_button("k-outlook", "provider.outlook", ProviderKind::Outlook, kind, cx)),
+                            .child(kind_button(
+                                "k-smtp",
+                                "provider.smtp",
+                                ProviderKind::Smtp,
+                                kind,
+                                cx,
+                            ))
+                            .child(kind_button(
+                                "k-mailgun",
+                                "provider.mailgun",
+                                ProviderKind::Mailgun,
+                                kind,
+                                cx,
+                            ))
+                            .child(kind_button(
+                                "k-ses",
+                                "provider.ses",
+                                ProviderKind::Ses,
+                                kind,
+                                cx,
+                            ))
+                            .child(kind_button(
+                                "k-gmail",
+                                "provider.gmail",
+                                ProviderKind::Gmail,
+                                kind,
+                                cx,
+                            ))
+                            .child(kind_button(
+                                "k-outlook",
+                                "provider.outlook",
+                                ProviderKind::Outlook,
+                                kind,
+                                cx,
+                            )),
                     ),
             )
             .child(labeled("acct.display", &self.form.display, cx))
@@ -1178,7 +1236,9 @@ impl MainWindow {
                                 .outline()
                                 .label(tr("acct.test"))
                                 .disabled(self.testing)
-                                .on_click(cx.listener(|this, _, _, cx| this.on_test_connection(cx))),
+                                .on_click(
+                                    cx.listener(|this, _, _, cx| this.on_test_connection(cx)),
+                                ),
                         )
                         .child(
                             Button::new("save-account")
@@ -1218,7 +1278,11 @@ impl MainWindow {
             .child(
                 h_flex()
                     .gap_3()
-                    .child(div().flex_1().child(labeled("acct.host", &self.form.smtp_host, cx)))
+                    .child(
+                        div()
+                            .flex_1()
+                            .child(labeled("acct.host", &self.form.smtp_host, cx)),
+                    )
                     .child(
                         div()
                             .w(px(120.))
@@ -1232,7 +1296,13 @@ impl MainWindow {
                     .child(
                         h_flex()
                             .gap_2()
-                            .child(tls_button("tls-starttls", "tls.starttls", TlsMode::StartTls, tls, cx))
+                            .child(tls_button(
+                                "tls-starttls",
+                                "tls.starttls",
+                                TlsMode::StartTls,
+                                tls,
+                                cx,
+                            ))
                             .child(tls_button("tls-tls", "tls.tls", TlsMode::Tls, tls, cx))
                             .child(tls_button("tls-none", "tls.none", TlsMode::None, tls, cx)),
                     ),
@@ -1254,8 +1324,20 @@ impl MainWindow {
                     .child(
                         h_flex()
                             .gap_2()
-                            .child(region_button("rg-us", "region.us", MailgunRegion::Us, region, cx))
-                            .child(region_button("rg-eu", "region.eu", MailgunRegion::Eu, region, cx)),
+                            .child(region_button(
+                                "rg-us",
+                                "region.us",
+                                MailgunRegion::Us,
+                                region,
+                                cx,
+                            ))
+                            .child(region_button(
+                                "rg-eu",
+                                "region.eu",
+                                MailgunRegion::Eu,
+                                region,
+                                cx,
+                            )),
                     ),
             )
             .child(labeled("acct.from", &self.form.mg_from, cx))
@@ -1268,12 +1350,16 @@ impl MainWindow {
             .child(
                 h_flex()
                     .gap_3()
+                    .child(div().w(px(160.)).child(labeled(
+                        "acct.region",
+                        &self.form.ses_region,
+                        cx,
+                    )))
                     .child(
                         div()
-                            .w(px(160.))
-                            .child(labeled("acct.region", &self.form.ses_region, cx)),
-                    )
-                    .child(div().flex_1().child(labeled("acct.from", &self.form.ses_from, cx))),
+                            .flex_1()
+                            .child(labeled("acct.from", &self.form.ses_from, cx)),
+                    ),
             )
             .child(labeled("acct.ses_key_id", &self.form.ses_key_id, cx))
             .child(labeled("acct.ses_secret", &self.form.ses_secret, cx))
@@ -1290,7 +1376,11 @@ impl MainWindow {
             .gap_3()
             .child(labeled("acct.gmail_from", &self.form.oauth_from, cx))
             .child(labeled("acct.client_id", &self.form.oauth_client_id, cx))
-            .child(labeled("acct.client_secret", &self.form.oauth_client_secret, cx))
+            .child(labeled(
+                "acct.client_secret",
+                &self.form.oauth_client_secret,
+                cx,
+            ))
             .child(
                 div()
                     .text_xs()
@@ -1303,7 +1393,11 @@ impl MainWindow {
         v_flex()
             .gap_3()
             .child(labeled("acct.oauth_from", &self.form.oauth_from, cx))
-            .child(labeled("acct.app_client_id", &self.form.oauth_client_id, cx))
+            .child(labeled(
+                "acct.app_client_id",
+                &self.form.oauth_client_id,
+                cx,
+            ))
             .child(labeled("acct.tenant", &self.form.oauth_tenant, cx))
             .child(
                 div()
@@ -1329,7 +1423,9 @@ impl MainWindow {
             _ => BTreeMap::new(),
         };
         for field in self.template_fields(cx) {
-            context.entry(field.clone()).or_insert_with(|| format!("[{field}]"));
+            context
+                .entry(field.clone())
+                .or_insert_with(|| format!("[{field}]"));
         }
         context
     }
@@ -1599,9 +1695,9 @@ impl MainWindow {
                 Button::new(SharedString::from(format!("sheet-{i}")))
                     .label(name.clone())
                     .selected(selected)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.on_select_sheet(value.clone(), cx)
-                    })),
+                    .on_click(
+                        cx.listener(move |this, _, _, cx| this.on_select_sheet(value.clone(), cx)),
+                    ),
             );
         }
         v_flex()
@@ -1696,7 +1792,11 @@ impl MainWindow {
         .into_any_element()
     }
 
-    fn render_validation_summary(&self, loaded: &Loaded, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_validation_summary(
+        &self,
+        loaded: &Loaded,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let report = &loaded.report;
         let theme = cx.theme();
 
@@ -1765,36 +1865,32 @@ impl MainWindow {
         let border = cx.theme().border;
         let count = table.row_count();
 
-        let list = uniform_list(
-            "recipients-preview",
-            count,
-            move |range, _window, cx| {
-                let mut items = Vec::with_capacity(range.end - range.start);
-                for ix in range {
-                    let (color, label) = status_style(&report.statuses[ix], cx);
-                    let row = &table.rows[ix];
-                    let cells = row_columns.iter().map(|(_, idx)| {
-                        div()
-                            .flex_1()
-                            .text_sm()
-                            .truncate()
-                            .child(row.get(*idx).cloned().unwrap_or_default())
-                    });
-                    items.push(
-                        h_flex()
-                            .w_full()
-                            .px_2()
-                            .py_1()
-                            .gap_2()
-                            .border_b_1()
-                            .border_color(border)
-                            .child(div().w(px(96.)).text_xs().text_color(color).child(label))
-                            .children(cells),
-                    );
-                }
-                items
-            },
-        )
+        let list = uniform_list("recipients-preview", count, move |range, _window, cx| {
+            let mut items = Vec::with_capacity(range.end - range.start);
+            for ix in range {
+                let (color, label) = status_style(&report.statuses[ix], cx);
+                let row = &table.rows[ix];
+                let cells = row_columns.iter().map(|(_, idx)| {
+                    div()
+                        .flex_1()
+                        .text_sm()
+                        .truncate()
+                        .child(row.get(*idx).cloned().unwrap_or_default())
+                });
+                items.push(
+                    h_flex()
+                        .w_full()
+                        .px_2()
+                        .py_1()
+                        .gap_2()
+                        .border_b_1()
+                        .border_color(border)
+                        .child(div().w(px(96.)).text_xs().text_color(color).child(label))
+                        .children(cells),
+                );
+            }
+            items
+        })
         .h(px(320.));
 
         v_flex()
@@ -2054,7 +2150,9 @@ impl MainWindow {
                 .background_executor()
                 .spawn(async move { mmm_engine::load_report(&parse_path) })
                 .await;
-            let _ = this.update(cx, |this, cx| this.on_resume_report_loaded(path, parsed, cx));
+            let _ = this.update(cx, |this, cx| {
+                this.on_resume_report_loaded(path, parsed, cx)
+            });
         })
         .detach();
     }
@@ -2222,14 +2320,12 @@ impl MainWindow {
                     )),
             )
             .when(!warnings.is_empty(), |this| {
-                this.child(
-                    v_flex().gap_1().children(warnings.into_iter().map(|w| {
-                        div()
-                            .text_sm()
-                            .text_color(cx.theme().warning)
-                            .child(format!("⚠ {w}"))
-                    })),
-                )
+                this.child(v_flex().gap_1().children(warnings.into_iter().map(|w| {
+                    div()
+                        .text_sm()
+                        .text_color(cx.theme().warning)
+                        .child(format!("⚠ {w}"))
+                })))
             })
             .when_some(self.send_notice.clone(), |this, notice| {
                 let color = if notice.ok {
@@ -2257,9 +2353,21 @@ impl MainWindow {
             .child(
                 h_flex()
                     .gap_3()
-                    .child(div().flex_1().child(labeled("send.mps", &self.send_mps, cx)))
-                    .child(div().flex_1().child(labeled("send.retry", &self.send_retry, cx)))
-                    .child(div().flex_1().child(labeled("send.stop", &self.send_stop, cx))),
+                    .child(
+                        div()
+                            .flex_1()
+                            .child(labeled("send.mps", &self.send_mps, cx)),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .child(labeled("send.retry", &self.send_retry, cx)),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .child(labeled("send.stop", &self.send_stop, cx)),
+                    ),
             )
     }
 
@@ -2382,13 +2490,18 @@ impl MainWindow {
             )
     }
 
-    fn render_finished(&self, summary: &CampaignSummary, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_finished(
+        &self,
+        summary: &CampaignSummary,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let (headline, color) = match &summary.state {
             CampaignState::Completed => (tr("send.done"), cx.theme().success),
             CampaignState::Cancelled => (tr("send.cancelled"), cx.theme().warning),
-            CampaignState::Stopped(reason) => {
-                (format!("{} — {reason}", tr("send.stopped")), cx.theme().danger)
-            }
+            CampaignState::Stopped(reason) => (
+                format!("{} — {reason}", tr("send.stopped")),
+                cx.theme().danger,
+            ),
             CampaignState::Running => (tr("send.finishing"), cx.theme().foreground),
         };
         let recent = self
@@ -2413,7 +2526,13 @@ impl MainWindow {
                         div()
                             .text_xs()
                             .text_color(cx.theme().muted_foreground)
-                            .child(t!("send.in_duration", d = format_duration(summary.elapsed_secs)).to_string()),
+                            .child(
+                                t!(
+                                    "send.in_duration",
+                                    d = format_duration(summary.elapsed_secs)
+                                )
+                                .to_string(),
+                            ),
                     ),
             )
             .child(self.render_recent_rows(&recent, cx))
@@ -2444,7 +2563,11 @@ impl MainWindow {
             )
     }
 
-    fn render_recent_rows(&self, recent: &[RowOutcome], cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_recent_rows(
+        &self,
+        recent: &[RowOutcome],
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let rows = recent.iter().take(12).map(|o| {
             let (color, label) = outcome_style(&o.status, cx);
             h_flex()
@@ -2572,12 +2695,15 @@ impl MainWindow {
             .body
             .update(cx, |s, cx| s.set_value("", window, cx));
         let d = SendingConfig::default();
-        self.send_mps
-            .update(cx, |s, cx| s.set_value(d.messages_per_second.to_string(), window, cx));
-        self.send_retry
-            .update(cx, |s, cx| s.set_value(d.retry_limit.to_string(), window, cx));
-        self.send_stop
-            .update(cx, |s, cx| s.set_value(d.stop_after_failures.to_string(), window, cx));
+        self.send_mps.update(cx, |s, cx| {
+            s.set_value(d.messages_per_second.to_string(), window, cx)
+        });
+        self.send_retry.update(cx, |s, cx| {
+            s.set_value(d.retry_limit.to_string(), window, cx)
+        });
+        self.send_stop.update(cx, |s, cx| {
+            s.set_value(d.stop_after_failures.to_string(), window, cx)
+        });
         self.selected_account = None;
         self.recipients = RecipientsState::Empty;
         self.preview_row = 0;
@@ -2627,9 +2753,9 @@ impl MainWindow {
         let dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
 
         // Subject + body (body lives in the sibling HTML file).
-        self.template
-            .subject
-            .update(cx, |s, cx| s.set_value(project.template.subject.clone(), window, cx));
+        self.template.subject.update(cx, |s, cx| {
+            s.set_value(project.template.subject.clone(), window, cx)
+        });
         let html_full = resolve(&dir, &project.template.html_path);
         let body = std::fs::read_to_string(&html_full).unwrap_or_default();
         self.template
@@ -2732,7 +2858,12 @@ impl MainWindow {
             RecipientsState::Loaded(l) => Some(RecipientSource {
                 source_path: relative_or_absolute(&dir, &l.path),
                 sheet: l.sheet.clone(),
-                email_column: l.table.headers.get(l.email_col).cloned().unwrap_or_default(),
+                email_column: l
+                    .table
+                    .headers
+                    .get(l.email_col)
+                    .cloned()
+                    .unwrap_or_default(),
                 mapping: l.mapping.clone(),
             }),
             _ => None,
@@ -2819,25 +2950,33 @@ impl MainWindow {
                                 Button::new("proj-new")
                                     .ghost()
                                     .label(tr("top.new"))
-                                    .on_click(cx.listener(|this, _, window, cx| this.on_new(window, cx))),
+                                    .on_click(
+                                        cx.listener(|this, _, window, cx| this.on_new(window, cx)),
+                                    ),
                             )
                             .child(
                                 Button::new("proj-open")
                                     .ghost()
                                     .label(tr("top.open"))
-                                    .on_click(cx.listener(|this, _, window, cx| this.on_open(window, cx))),
+                                    .on_click(
+                                        cx.listener(|this, _, window, cx| this.on_open(window, cx)),
+                                    ),
                             )
                             .child(
                                 Button::new("proj-save")
                                     .primary()
                                     .label(tr("top.save"))
-                                    .on_click(cx.listener(|this, _, window, cx| this.on_save(window, cx))),
+                                    .on_click(
+                                        cx.listener(|this, _, window, cx| this.on_save(window, cx)),
+                                    ),
                             )
                             .child(
                                 Button::new("proj-save-as")
                                     .ghost()
                                     .label(tr("top.save_as"))
-                                    .on_click(cx.listener(|this, _, window, cx| this.on_save_as(window, cx))),
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.on_save_as(window, cx)
+                                    })),
                             ),
                     ),
             )
@@ -2941,7 +3080,10 @@ fn apply_theme_mode(pref: ThemePref, window: &mut Window, cx: &mut App) {
 /// The campaign base name from a project path: strips the `.mmproj.toml`
 /// suffix, else falls back to the file stem.
 fn base_name(path: &Path) -> String {
-    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("campaign");
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("campaign");
     if let Some(stripped) = name.strip_suffix(PROJECT_SUFFIX) {
         stripped.to_string()
     } else {
@@ -3020,7 +3162,11 @@ fn outcome_style(status: &OutcomeStatus, cx: &App) -> (Hsla, SharedString) {
 }
 
 /// A "Label   value" line for the pre-flight summary card; `label_key` is i18n.
-fn summary_row(label_key: &'static str, value: String, cx: &Context<MainWindow>) -> impl IntoElement {
+fn summary_row(
+    label_key: &'static str,
+    value: String,
+    cx: &Context<MainWindow>,
+) -> impl IntoElement {
     h_flex()
         .gap_3()
         .items_baseline()

@@ -185,10 +185,7 @@ pub async fn connect(account: &Account, client_secret: &str) -> Result<Tokens, S
     let listener = TcpListener::bind(("127.0.0.1", 0))
         .await
         .map_err(|e| format!("could not start local listener: {e}"))?;
-    let port = listener
-        .local_addr()
-        .map_err(|e| e.to_string())?
-        .port();
+    let port = listener.local_addr().map_err(|e| e.to_string())?.port();
     let redirect_uri = format!("http://{}:{}", ep.redirect_host, port);
 
     let auth_url = build_auth_url(&ep, &client_id, &redirect_uri, &challenge, &state);

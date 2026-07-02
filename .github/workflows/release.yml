@@ -1,0 +1,118 @@
+name: Release
+
+# Tag a release like `v0.1.0` to trigger cross-platform builds. Artifacts are
+# attached to a DRAFT GitHub Release so you can review before publishing.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write # required for softprops/action-gh-release to upload assets
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.target_name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target_name: linux-x86_64
+          - os: macos-latest
+            target_name: macos-aarch64
+          - os: windows-latest
+            target_name: windows-x86_64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config cmake clang \
+            libfontconfig-dev libfreetype6-dev \
+            libwayland-dev libxkbcommon-x11-dev \
+            libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libssl-dev libvulkan-dev libgl1-mesa-dev
+
+      - name: Install NASM (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/setup-nasm@v1
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # Version = the tag (without leading v), falling back to the workspace
+      # version in Cargo.toml. Embedded in the binary and used by the installer.
+      - name: Compute version
+        shell: bash
+        run: |
+          ver="${GITHUB_REF_NAME#v}"
+          if [ "$ver" = "$GITHUB_REF_NAME" ]; then
+            ver=$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
+          fi
+          echo "MFM_VERSION=$ver" >> "$GITHUB_ENV"
+          echo "Version: $ver"
+
+      - name: Build
+        run: cargo build -p mmm-app --release --locked
+
+      # ---- Optional code signing (add the secrets, then uncomment) ----------
+      # Windows Authenticode: needs WINDOWS_CERT_BASE64 + WINDOWS_CERT_PASSWORD.
+      # macOS notarization: needs APPLE_CERT_*, APPLE_ID, APPLE_TEAM_ID, etc.
+      # These are intentionally left out so the workflow runs without secrets.
+
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          staging="massfckinmailer-${{ matrix.target_name }}"
+          mkdir "$staging"
+          cp target/release/massfckinmailer "$staging"/
+          cp README.md LICENSE-MIT LICENSE-APACHE "$staging"/
+          tar czf "$staging.tar.gz" "$staging"
+
+      - name: Package portable zip (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $staging = "massfckinmailer-${{ matrix.target_name }}"
+          New-Item -ItemType Directory -Force -Path $staging | Out-Null
+          Copy-Item target/release/massfckinmailer.exe $staging/
+          Copy-Item README.md, LICENSE-MIT, LICENSE-APACHE $staging/
+          Compress-Archive -Path "$staging/*" -DestinationPath "$staging.zip"
+
+      - name: Build Windows installer (Inno Setup)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install innosetup -y --no-progress
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" `
+            "/DMyAppVersion=$env:MFM_VERSION" `
+            "/DOutputBase=massfckinmailer-${{ matrix.target_name }}-setup" `
+            installer\windows\massfckinmailer.iss
+
+      - name: Upload to GitHub Release (Unix)
+        if: runner.os != 'Windows'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: massfckinmailer-${{ matrix.target_name }}.tar.gz
+          draft: true
+          fail_on_unmatched_files: true
+
+      - name: Upload to GitHub Release (Windows)
+        if: runner.os == 'Windows'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            massfckinmailer-${{ matrix.target_name }}.zip
+            dist/massfckinmailer-${{ matrix.target_name }}-setup.exe
+          draft: true
+          fail_on_unmatched_files: true

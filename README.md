@@ -1,5 +1,8 @@
 # MassFckinMailer
 
+[![CI](https://github.com/ebesirik/MassFckinMailer/actions/workflows/ci.yml/badge.svg)](https://github.com/ebesirik/MassFckinMailer/actions/workflows/ci.yml)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
+
 Cross-platform desktop mass mailer in Rust — gpui + gpui-component. Non-blocking,
 smooth, lightweight. See [PLAN.md](PLAN.md) for the full design.
 
@@ -53,6 +56,44 @@ On Windows the icon is embedded in the `.exe` automatically at build time
 | Linux AppImage | [`cargo-appimage`](https://github.com/StratusFearMe21/cargo-appimage) | `cargo appimage` |
 
 Each installer must be produced on (or cross-compiled for) its own platform.
+
+## Continuous integration & release channels
+
+GitHub Actions (`.github/workflows/`) drive builds across Linux, macOS, and
+Windows:
+
+- **CI** (`ci.yml`) — on pushes to `master`/`beta`/`dev` and all PRs: rustfmt,
+  clippy, tests, and a release build on every platform.
+- **Channels** (`channels.yml`) — pushing a channel branch publishes a *rolling*
+  pre-release (one release per channel, updated in place):
+  - `beta` → the **Beta** pre-release (tag `beta`)
+  - `dev` → the **Nightly** pre-release (tag `nightly`)
+- **Stable** (`release.yml`) — pushing a `v*` tag (e.g. `v0.1.0`) builds all
+  platforms and attaches archives to a **draft** GitHub Release for review.
+  `master` never auto-releases; stable ships from tags.
+
+Every release (stable and channel) ships a portable archive per platform, and
+**Windows additionally gets a one-click installer** (`…-setup.exe`) built with
+[Inno Setup](https://jrsoftware.org/isinfo.php) from
+[`installer/windows/massfckinmailer.iss`](installer/windows/massfckinmailer.iss).
+
+### Versioning
+
+The single source of truth is `[workspace.package] version` in the root
+`Cargo.toml` (all crates inherit it). Pipelines derive the displayed version
+from it and append a build number (the GitHub Actions run number):
+
+- stable → the tag, e.g. `0.1.0`
+- beta → `0.1.0-beta.<run>`
+- nightly → `0.1.0-nightly.<yyyymmdd>.<run>`
+
+That string is embedded at build time (`MFM_VERSION`, wired through
+`crates/app/build.rs`) and shown in the app's sidebar. Local builds fall back to
+the plain `Cargo.toml` version.
+
+No repository secrets are required for any of the above. Code signing /
+notarization is stubbed (commented) in `release.yml` for when you add the
+relevant secrets.
 
 ## OAuth setup (Gmail / Outlook)
 

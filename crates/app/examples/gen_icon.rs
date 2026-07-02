@@ -38,7 +38,16 @@ fn main() {
 
 /// Fill a rounded rectangle given in 256-space, scaled by `k`.
 #[allow(clippy::too_many_arguments)]
-fn fill_rounded_rect(img: &mut RgbaImage, x: f32, y: f32, w: f32, h: f32, r: f32, k: f32, color: Rgba<u8>) {
+fn fill_rounded_rect(
+    img: &mut RgbaImage,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    r: f32,
+    k: f32,
+    color: Rgba<u8>,
+) {
     let (x0, y0, x1, y1) = (x * k, y * k, (x + w) * k, (y + h) * k);
     let rk = r * k;
     for py in y0 as u32..y1 as u32 {
@@ -73,7 +82,14 @@ fn disc(img: &mut RgbaImage, cx: f32, cy: f32, radius: f32, k: f32, color: Rgba<
     }
 }
 
-fn thick_line(img: &mut RgbaImage, a: (f32, f32), b: (f32, f32), half: f32, k: f32, color: Rgba<u8>) {
+fn thick_line(
+    img: &mut RgbaImage,
+    a: (f32, f32),
+    b: (f32, f32),
+    half: f32,
+    k: f32,
+    color: Rgba<u8>,
+) {
     let steps = 800;
     for i in 0..=steps {
         let t = i as f32 / steps as f32;

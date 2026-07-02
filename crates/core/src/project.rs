@@ -234,7 +234,14 @@ mod tests {
         // Re-pushing an existing entry moves it to the front without duplicating.
         recent.push(Path::new("/p/5.mmproj.toml"));
         assert_eq!(recent.paths[0], "/p/5.mmproj.toml");
-        assert_eq!(recent.paths.iter().filter(|p| *p == "/p/5.mmproj.toml").count(), 1);
+        assert_eq!(
+            recent
+                .paths
+                .iter()
+                .filter(|p| *p == "/p/5.mmproj.toml")
+                .count(),
+            1
+        );
     }
 
     #[test]

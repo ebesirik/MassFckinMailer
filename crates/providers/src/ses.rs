@@ -156,7 +156,10 @@ impl EmailProvider for SesProvider {
         if let Some(text) = &message.text_alt {
             body = body.text(Self::content(text)?);
         }
-        let simple = Message::builder().subject(subject).body(body.build()).build();
+        let simple = Message::builder()
+            .subject(subject)
+            .body(body.build())
+            .build();
         let content = EmailContent::builder().simple(simple).build();
         let destination = Destination::builder()
             .to_addresses(message.to.clone())

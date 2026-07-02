@@ -5,8 +5,8 @@
 use crate::account::GmailConfig;
 use crate::oauth::{self, Endpoints, Tokens};
 use crate::{
-    Capabilities, EmailProvider, ProviderError, ProviderKind, RenderedEmail, SendError, SendReceipt,
-    secrets,
+    Capabilities, EmailProvider, ProviderError, ProviderKind, RenderedEmail, SendError,
+    SendReceipt, secrets,
 };
 use async_trait::async_trait;
 use base64::Engine as _;
@@ -28,7 +28,11 @@ pub struct GmailProvider {
 
 impl GmailProvider {
     /// `secret` is the keychain JSON produced by the OAuth connect flow.
-    pub fn new(account_id: &str, config: &GmailConfig, secret: String) -> Result<Self, ProviderError> {
+    pub fn new(
+        account_id: &str,
+        config: &GmailConfig,
+        secret: String,
+    ) -> Result<Self, ProviderError> {
         let tokens = Tokens::from_json(&secret).map_err(ProviderError::Config)?;
         let from = config
             .from
@@ -106,10 +110,7 @@ impl EmailProvider for GmailProvider {
             return Err(SendError::Cancelled);
         }
         let raw = URL_SAFE_NO_PAD.encode(self.build_mime(message)?);
-        let token = self
-            .access_token()
-            .await
-            .map_err(SendError::Retryable)?;
+        let token = self.access_token().await.map_err(SendError::Retryable)?;
 
         let request = self
             .client

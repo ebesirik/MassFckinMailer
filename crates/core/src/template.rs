@@ -71,7 +71,10 @@ pub enum RenderError {
 /// Render a template with `{{field}}`/`##field##` placeholders against a
 /// `field -> value` context. Any placeholder without a value is reported up
 /// front (with its name) rather than rendered blank.
-pub fn render(template_src: &str, context: &BTreeMap<String, String>) -> Result<String, RenderError> {
+pub fn render(
+    template_src: &str,
+    context: &BTreeMap<String, String>,
+) -> Result<String, RenderError> {
     let normalized = normalize_placeholders(template_src);
 
     // Precise, friendly missing-field detection for our simple placeholders.
@@ -121,7 +124,10 @@ pub fn html_to_text(html: &str) -> String {
         .map(|l| l.trim_end())
         .collect::<Vec<_>>()
         .join("\n");
-    MANY_NEWLINES.replace_all(&trimmed, "\n\n").trim().to_string()
+    MANY_NEWLINES
+        .replace_all(&trimmed, "\n\n")
+        .trim()
+        .to_string()
 }
 
 #[cfg(test)]
@@ -153,8 +159,7 @@ mod tests {
 
     #[test]
     fn missing_field_errors_with_name() {
-        let err = render("Hi {{first_name}} {{city}}", &ctx(&[("first_name", "Ada")]))
-            .unwrap_err();
+        let err = render("Hi {{first_name}} {{city}}", &ctx(&[("first_name", "Ada")])).unwrap_err();
         match err {
             RenderError::Missing(names) => assert_eq!(names, "city"),
             other => panic!("expected Missing, got {other:?}"),

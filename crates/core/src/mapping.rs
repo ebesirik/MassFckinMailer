@@ -194,11 +194,11 @@ mod tests {
         let t = table(
             &["email", "name"],
             &[
-                &["a@x.com", "Ada"],     // Ok
-                &["nope", "Bob"],        // InvalidEmail
-                &["a@x.com", "Ada2"],    // Duplicate (case-insensitive of row 0)
-                &["c@z.com", ""],        // MissingFields([name])
-                &["", "Dan"],            // InvalidEmail (empty)
+                &["a@x.com", "Ada"],  // Ok
+                &["nope", "Bob"],     // InvalidEmail
+                &["a@x.com", "Ada2"], // Duplicate (case-insensitive of row 0)
+                &["c@z.com", ""],     // MissingFields([name])
+                &["", "Dan"],         // InvalidEmail (empty)
             ],
         );
         let required = vec![("name".to_string(), 1usize)];

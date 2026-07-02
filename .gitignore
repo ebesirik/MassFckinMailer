@@ -1,3 +1,4 @@
 /target
+/dist
 *.mmproj.toml.bak
 .idea

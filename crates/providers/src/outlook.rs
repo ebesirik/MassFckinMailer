@@ -4,8 +4,8 @@
 use crate::account::OutlookConfig;
 use crate::oauth::{self, Endpoints, Tokens};
 use crate::{
-    Capabilities, EmailProvider, ProviderError, ProviderKind, RenderedEmail, SendError, SendReceipt,
-    secrets,
+    Capabilities, EmailProvider, ProviderError, ProviderKind, RenderedEmail, SendError,
+    SendReceipt, secrets,
 };
 use async_trait::async_trait;
 use tokio::sync::Mutex;

@@ -72,6 +72,21 @@ credentials/tooling: actual SMTP/Mailgun/SES delivery, Gmail/Outlook OAuth
 (needs the user's own Google Cloud / Azure app + interactive browser consent),
 and producing platform installers. See README for setup + packaging commands.
 
+## CI & releases (`.github/workflows/`)
+
+- `ci.yml` — fmt/clippy/test/build on Linux+macOS+Windows for `master`/`beta`/`dev`
+  pushes and PRs.
+- `channels.yml` — pushing `beta` or `dev` updates a rolling pre-release
+  (`beta` → "Beta", `dev` → "nightly"): it force-moves the channel tag to the new
+  commit and overwrites the per-platform assets. `master` is intentionally excluded.
+- `release.yml` — a `v*` tag builds all platforms into a draft GitHub Release
+  (stable). No secrets required; signing is stubbed/commented.
+- **Version**: single source is `[workspace.package] version` in `Cargo.toml`.
+  Pipelines compute `MFM_VERSION` (base + channel + Actions run number) and pass
+  it to the build; `crates/app/build.rs` embeds it via `env!("MFM_VERSION")`
+  (falling back to the crate version locally), shown as `APP_VERSION` in the
+  sidebar. Bump the version in one place — `Cargo.toml`.
+
 ## Status
 
 All milestones M0–M8 complete; the app is feature-complete per PLAN.md, and the

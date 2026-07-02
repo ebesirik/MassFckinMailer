@@ -124,10 +124,7 @@ const CSV_DELIMITERS: [u8; 3] = [b',', b';', b'\t'];
 /// Guess the delimiter from the first non-blank line: whichever candidate
 /// appears most often wins, defaulting to comma when none are present.
 pub fn sniff_delimiter(sample: &str) -> u8 {
-    let line = sample
-        .lines()
-        .find(|l| !l.trim().is_empty())
-        .unwrap_or("");
+    let line = sample.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
     let count = |d: u8| line.matches(d as char).count();
     CSV_DELIMITERS
         .into_iter()
@@ -199,7 +196,10 @@ pub fn parse_excel(path: &Path, sheet: Option<&str>) -> Result<RecipientTable, I
 
     let mut iter = range.rows();
     let headers: Vec<String> = match iter.next() {
-        Some(row) => row.iter().map(|c| c.to_string().trim().to_string()).collect(),
+        Some(row) => row
+            .iter()
+            .map(|c| c.to_string().trim().to_string())
+            .collect(),
         None => return Err(ImportError::Empty),
     };
     let width = headers.len();
@@ -329,10 +329,7 @@ mod tests {
 
     #[test]
     fn empty_input_is_error() {
-        assert!(matches!(
-            parse_csv_bytes(b""),
-            Err(ImportError::Empty)
-        ));
+        assert!(matches!(parse_csv_bytes(b""), Err(ImportError::Empty)));
     }
 
     #[test]

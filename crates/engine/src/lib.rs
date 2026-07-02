@@ -33,7 +33,10 @@ pub enum Command {
     /// Run a provider connectivity/credentials check ("Test connection").
     /// `secret` is the keychain value (SMTP password / API key) supplied by the
     /// caller so the engine needn't touch the keychain.
-    TestAccount { account: Account, secret: String },
+    TestAccount {
+        account: Account,
+        secret: String,
+    },
     /// Run the interactive OAuth flow for an account (opens the browser) and,
     /// on success, store its tokens in the keychain. `client_secret` is empty
     /// for public clients (e.g. Azure with PKCE).
@@ -47,7 +50,9 @@ pub enum Command {
     /// Cancel the running campaign. Emails already delivered stay delivered.
     CancelCampaign,
     /// Write the last campaign's outcome report to `path` as CSV.
-    ExportReport { path: PathBuf },
+    ExportReport {
+        path: PathBuf,
+    },
     Shutdown,
 }
 
@@ -295,7 +300,10 @@ async fn connect_oauth(account: Account, client_secret: String, events: flume::S
     let (ok, message) = match mmm_providers::oauth::connect(&account, &client_secret).await {
         Ok(tokens) => match mmm_providers::oauth::store_tokens(&account.id, &tokens) {
             Ok(()) => (true, "Connected and authorized.".to_string()),
-            Err(e) => (false, format!("Authorized, but could not store tokens: {e}")),
+            Err(e) => (
+                false,
+                format!("Authorized, but could not store tokens: {e}"),
+            ),
         },
         Err(e) => (false, e),
     };
@@ -378,9 +386,7 @@ async fn run_campaign(
             state: CampaignState::Completed,
             elapsed_secs: 0,
         };
-        let _ = events
-            .send_async(Event::CampaignFinished { summary })
-            .await;
+        let _ = events.send_async(Event::CampaignFinished { summary }).await;
         return;
     }
 
@@ -391,7 +397,10 @@ async fn run_campaign(
     drop(tx);
 
     let capabilities = provider.capabilities();
-    let rate = quota_rate(plan.messages_per_second, capabilities.suggested_rate_per_sec);
+    let rate = quota_rate(
+        plan.messages_per_second,
+        capabilities.suggested_rate_per_sec,
+    );
     let limiter = RateLimiter::direct(Quota::per_second(rate));
     let workers = total.clamp(1, 4);
 
@@ -478,9 +487,7 @@ async fn run_campaign(
         state,
         elapsed_secs: start.elapsed().as_secs(),
     };
-    let _ = events
-        .send_async(Event::CampaignFinished { summary })
-        .await;
+    let _ = events.send_async(Event::CampaignFinished { summary }).await;
 }
 
 async fn worker(shared: Arc<Shared>) {
@@ -510,8 +517,13 @@ async fn worker(shared: Arc<Shared>) {
             }
         };
 
-        let (status, error, message_id) =
-            send_with_retry(&shared.provider, &rendered, &shared.token, shared.retry_limit).await;
+        let (status, error, message_id) = send_with_retry(
+            &shared.provider,
+            &rendered,
+            &shared.token,
+            shared.retry_limit,
+        )
+        .await;
 
         match status {
             OutcomeStatus::Sent => {
@@ -588,9 +600,14 @@ fn record(shared: &Arc<Shared>, outcome: RowOutcome) {
     shared.report.lock().unwrap().push(outcome);
 }
 
-fn render_email(templates: &Templates, recipient: &CampaignRecipient) -> Result<RenderedEmail, String> {
-    let subject = template::render(&templates.subject, &recipient.context).map_err(|e| e.to_string())?;
-    let html_body = template::render(&templates.body, &recipient.context).map_err(|e| e.to_string())?;
+fn render_email(
+    templates: &Templates,
+    recipient: &CampaignRecipient,
+) -> Result<RenderedEmail, String> {
+    let subject =
+        template::render(&templates.subject, &recipient.context).map_err(|e| e.to_string())?;
+    let html_body =
+        template::render(&templates.body, &recipient.context).map_err(|e| e.to_string())?;
     let text_alt = templates
         .generate_text_alt
         .then(|| template::html_to_text(&html_body));
@@ -638,14 +655,23 @@ async fn send_with_retry(
     }
 }
 
-fn snapshot(shared: &Arc<Shared>, total: usize, start: Instant, state: CampaignState) -> CampaignProgress {
+fn snapshot(
+    shared: &Arc<Shared>,
+    total: usize,
+    start: Instant,
+    state: CampaignState,
+) -> CampaignProgress {
     let sent = shared.sent.load(Ordering::Relaxed);
     let failed = shared.failed.load(Ordering::Relaxed);
     let skipped = shared.skipped.load(Ordering::Relaxed);
     let processed = sent + failed + skipped;
 
     let elapsed = start.elapsed().as_secs_f32();
-    let rate = if elapsed > 0.0 { sent as f32 / elapsed } else { 0.0 };
+    let rate = if elapsed > 0.0 {
+        sent as f32 / elapsed
+    } else {
+        0.0
+    };
     let remaining = total.saturating_sub(processed);
     let eta = if rate > 0.0 && remaining > 0 {
         Some((remaining as f32 / rate).ceil() as u64)
@@ -707,7 +733,10 @@ pub fn load_report(path: &std::path::Path) -> Result<Vec<RowOutcome>, String> {
         };
         let error = record.get(3).filter(|s| !s.is_empty()).map(String::from);
         let provider_message_id = record.get(4).filter(|s| !s.is_empty()).map(String::from);
-        let timestamp_ms = record.get(5).and_then(|s| s.trim().parse().ok()).unwrap_or(0);
+        let timestamp_ms = record
+            .get(5)
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(0);
         rows.push(RowOutcome {
             index,
             email,
@@ -720,7 +749,10 @@ pub fn load_report(path: &std::path::Path) -> Result<Vec<RowOutcome>, String> {
     Ok(rows)
 }
 
-fn export_csv(report: &Arc<Mutex<Vec<RowOutcome>>>, path: &std::path::Path) -> Result<usize, String> {
+fn export_csv(
+    report: &Arc<Mutex<Vec<RowOutcome>>>,
+    path: &std::path::Path,
+) -> Result<usize, String> {
     let rows = report.lock().unwrap().clone();
     let mut writer = csv::Writer::from_path(path).map_err(|e| e.to_string())?;
     writer
@@ -937,7 +969,10 @@ mod tests {
         assert!(matches!(summary.state, CampaignState::Stopped(_)));
         // Not everything was attempted; some were skipped by the breaker's cancel.
         assert!(summary.skipped > 0);
-        assert_eq!(summary.sent + summary.failed + summary.skipped, summary.total);
+        assert_eq!(
+            summary.sent + summary.failed + summary.skipped,
+            summary.total
+        );
     }
 
     #[test]
@@ -995,7 +1030,9 @@ mod tests {
         run_campaign(
             provider,
             plan(
-                (0..10).map(|i| recipient(i, &format!("r{i}@x.com"), "X")).collect(),
+                (0..10)
+                    .map(|i| recipient(i, &format!("r{i}@x.com"), "X"))
+                    .collect(),
                 0,
             ),
             token,

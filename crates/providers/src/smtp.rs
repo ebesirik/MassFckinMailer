@@ -30,10 +30,7 @@ impl SmtpProvider {
 
         let transport = builder
             .port(config.port)
-            .credentials(Credentials::new(
-                config.username.clone(),
-                password,
-            ))
+            .credentials(Credentials::new(config.username.clone(), password))
             .build();
 
         let from = config
