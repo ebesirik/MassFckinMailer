@@ -26,6 +26,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
+pub mod update;
+pub use update::UpdateInfo;
+
 // ---- Public API ---------------------------------------------------------
 
 #[derive(Debug, Clone)]
@@ -53,6 +56,12 @@ pub enum Command {
     ExportReport {
         path: PathBuf,
     },
+    /// Ask GitHub whether a newer release exists on this build's channel.
+    CheckUpdate {
+        current_version: String,
+    },
+    /// Download, verify, and apply a previously discovered update.
+    ApplyUpdate(Box<UpdateInfo>),
     Shutdown,
 }
 
@@ -78,6 +87,16 @@ pub enum Event {
     CampaignFinished { summary: CampaignSummary },
     /// Result of a [`Command::ExportReport`].
     ReportExported { ok: bool, message: String },
+    /// A newer release is available (result of [`Command::CheckUpdate`]).
+    UpdateAvailable(Box<UpdateInfo>),
+    /// The check succeeded and this build is current.
+    UpdateNotAvailable,
+    /// The update check failed softly (offline, rate-limited, …).
+    UpdateCheckFailed { message: String },
+    /// An update was applied; the app should quit (a new process is starting).
+    UpdateApplied,
+    /// Applying the update failed.
+    UpdateFailed { message: String },
 }
 
 /// Everything the engine needs to send one campaign.
@@ -284,6 +303,27 @@ async fn run_loop(cmd_rx: flume::Receiver<Command>, evt_tx: flume::Sender<Event>
                     },
                 };
                 let _ = evt_tx.send_async(event).await;
+            }
+            Command::CheckUpdate { current_version } => {
+                let events = evt_tx.clone();
+                tokio::spawn(async move {
+                    let event = match update::check(&current_version).await {
+                        Ok(Some(info)) => Event::UpdateAvailable(Box::new(info)),
+                        Ok(None) => Event::UpdateNotAvailable,
+                        Err(message) => Event::UpdateCheckFailed { message },
+                    };
+                    let _ = events.send_async(event).await;
+                });
+            }
+            Command::ApplyUpdate(info) => {
+                let events = evt_tx.clone();
+                tokio::spawn(async move {
+                    let event = match update::apply(&info).await {
+                        Ok(()) => Event::UpdateApplied,
+                        Err(message) => Event::UpdateFailed { message },
+                    };
+                    let _ = events.send_async(event).await;
+                });
             }
             Command::Shutdown => {
                 if let Some(token) = current.take() {

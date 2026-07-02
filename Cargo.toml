@@ -42,6 +42,12 @@ rand = "0.8"
 url = "2"
 open = "5"
 
+# Auto-update (OTA via GitHub Releases)
+semver = "1"
+self-replace = "1"
+flate2 = "1"
+tar = "0.4"
+
 # Email providers
 lettre = { version = "0.11", default-features = false, features = [
     "smtp-transport",

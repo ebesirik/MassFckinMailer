@@ -13,5 +13,15 @@ csv.workspace = true
 mmm-core.workspace = true
 mmm-providers.workspace = true
 
+# Auto-update: query GitHub Releases, verify + swap the binary / run the installer
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+semver.workspace = true
+sha2.workspace = true
+self-replace.workspace = true
+flate2.workspace = true
+tar.workspace = true
+
 [dev-dependencies]
 async-trait.workspace = true

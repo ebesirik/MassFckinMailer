@@ -35,8 +35,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # gpui links against these on Linux (Wayland/X11, fontconfig, xkbcommon).
-      # Adjust if a future gpui version needs more.
+      # System libs gpui needs on Linux (Wayland/X11, fontconfig, xkbcommon),
+      # plus dbus for keyring's Secret Service backend. Adjust as deps change.
       - name: Install Linux system dependencies
         if: runner.os == 'Linux'
         run: |
@@ -46,7 +46,7 @@ jobs:
             libfontconfig-dev libfreetype6-dev \
             libwayland-dev libxkbcommon-x11-dev \
             libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
-            libssl-dev libvulkan-dev libgl1-mesa-dev
+            libssl-dev libdbus-1-dev libvulkan-dev libgl1-mesa-dev
 
       # Some crypto crates (ring / aws-lc-sys) need NASM to assemble on Windows.
       - name: Install NASM (Windows)

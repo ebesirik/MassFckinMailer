@@ -49,7 +49,7 @@ fn tr(key: &str) -> String {
 const APP_VERSION: &str = env!("MFM_VERSION");
 use mmm_engine::{
     CampaignPlan, CampaignProgress, CampaignRecipient, CampaignState, CampaignSummary, Command,
-    Event, MailRuntime, OutcomeStatus, RowOutcome,
+    Event, MailRuntime, OutcomeStatus, RowOutcome, UpdateInfo,
 };
 use mmm_providers::{
     Account, AccountConfig, AccountStore, GmailConfig, MailgunConfig, MailgunRegion, OutlookConfig,
@@ -355,6 +355,14 @@ pub struct MainWindow {
     theme_pref: ThemePref,
     /// Kept alive so system-appearance changes keep firing (Auto mode).
     _appearance_sub: Subscription,
+
+    // Auto-update (OTA via GitHub)
+    /// A newer release found for this build's channel, if any.
+    available_update: Option<UpdateInfo>,
+    /// True while an update is downloading / being applied.
+    update_applying: bool,
+    /// Last update error, shown next to the banner.
+    update_error: Option<String>,
 }
 
 fn read_trimmed(input: &Entity<InputState>, cx: &App) -> String {
@@ -365,6 +373,11 @@ impl MainWindow {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let mail = MailRuntime::start();
 
+        // Quietly check GitHub for a newer build on this channel at startup.
+        mail.command(Command::CheckUpdate {
+            current_version: APP_VERSION.to_string(),
+        });
+
         // Event pump: await engine events on the foreground executor and
         // update this entity. flume's recv_async is runtime-agnostic, so no
         // tokio is needed on this side.
@@ -373,7 +386,7 @@ impl MainWindow {
             while let Ok(event) = events.recv_async().await {
                 let alive = this
                     .update(cx, |this, cx| {
-                        this.on_engine_event(event);
+                        this.on_engine_event(event, cx);
                         cx.notify();
                     })
                     .is_ok();
@@ -438,7 +451,20 @@ impl MainWindow {
             language: settings.language,
             theme_pref: settings.theme,
             _appearance_sub: appearance_sub,
+            available_update: None,
+            update_applying: false,
+            update_error: None,
         }
+    }
+
+    fn on_apply_update(&mut self, cx: &mut Context<Self>) {
+        let Some(info) = self.available_update.clone() else {
+            return;
+        };
+        self.update_applying = true;
+        self.update_error = None;
+        self.mail.command(Command::ApplyUpdate(Box::new(info)));
+        cx.notify();
     }
 
     fn apply_theme(&self, window: &mut Window, cx: &mut App) {
@@ -496,7 +522,7 @@ impl MainWindow {
         }
     }
 
-    fn on_engine_event(&mut self, event: Event) {
+    fn on_engine_event(&mut self, event: Event, cx: &mut Context<Self>) {
         match event {
             Event::TestResult { ok, message, .. } => {
                 self.testing = false;
@@ -546,6 +572,21 @@ impl MainWindow {
             }
             Event::ReportExported { ok, message } => {
                 self.send_notice = Some(Notice { ok, text: message });
+            }
+            Event::UpdateAvailable(info) => {
+                self.available_update = Some(*info);
+                self.update_error = None;
+            }
+            // Silent on startup: being up to date or offline needs no fanfare.
+            Event::UpdateNotAvailable | Event::UpdateCheckFailed { .. } => {}
+            Event::UpdateApplied => {
+                // A new/updated process is starting (or the installer is running);
+                // step aside so it can take over.
+                cx.quit();
+            }
+            Event::UpdateFailed { message } => {
+                self.update_applying = false;
+                self.update_error = Some(message);
             }
         }
     }
@@ -989,6 +1030,48 @@ impl MainWindow {
 
     // ---- Rendering ------------------------------------------------------
 
+    /// A subtle "update available" card in the sidebar; empty when there's
+    /// nothing to offer. Notify-and-click — never auto-applies.
+    fn render_update_banner(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let Some(info) = &self.available_update else {
+            return div();
+        };
+        let label = if self.update_applying {
+            tr("update.downloading")
+        } else {
+            tr("update.restart")
+        };
+        v_flex()
+            .m_2()
+            .p_2()
+            .gap_1()
+            .rounded(cx.theme().radius)
+            .border_1()
+            .border_color(cx.theme().primary)
+            .bg(cx.theme().accent)
+            .child(div().text_xs().child(tr("update.available")))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(format!("v{}", info.version)),
+            )
+            .child(
+                Button::new("update-apply")
+                    .primary()
+                    .w_full()
+                    .label(label)
+                    .disabled(self.update_applying)
+                    .on_click(cx.listener(|this, _, _, cx| this.on_apply_update(cx))),
+            )
+            .children(self.update_error.as_ref().map(|err| {
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().danger)
+                    .child(err.clone())
+            }))
+    }
+
     fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         Sidebar::left()
             .w(px(220.))
@@ -1038,6 +1121,7 @@ impl MainWindow {
                     },
                 ))),
             )
+            .footer(self.render_update_banner(cx))
     }
 
     fn render_content(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {

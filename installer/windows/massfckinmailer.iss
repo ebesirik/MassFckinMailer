@@ -40,6 +40,10 @@ ArchitecturesInstallIn64BitMode=x64compatible
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
+; Let the auto-updater upgrade a running instance: close it (Restart Manager)
+; so its locked .exe can be replaced, then the [Run] entry relaunches it.
+CloseApplications=yes
+RestartApplications=no
 SetupIconFile={#AppIcon}
 LicenseFile=..\..\LICENSE-MIT
 OutputDir={#OutputDir}
@@ -60,4 +64,6 @@ Name: "{group}\{cm:UninstallProgram,{#MyAppName}}"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
 
 [Run]
-Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent
+; runasoriginaluser: relaunch as the user (not elevated). No skipifsilent, so a
+; silent auto-update relaunches the app after upgrading.
+Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall runasoriginaluser

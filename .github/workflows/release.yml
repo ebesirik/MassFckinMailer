@@ -2,6 +2,15 @@ name: Release
 
 # Tag a release like `v0.1.0` to trigger cross-platform builds. Artifacts are
 # attached to a DRAFT GitHub Release so you can review before publishing.
+#
+# Code signing is OPTIONAL and activates automatically when the relevant
+# secrets exist (see docs/SIGNING.md for the full walkthrough):
+#   macOS  — MACOS_CERT_BASE64, MACOS_CERT_PASSWORD (Developer ID .p12)
+#            + APPLE_ID, APPLE_TEAM_ID, APPLE_APP_PASSWORD (notarization)
+#            → additionally ships a signed, notarized, stapled .dmg
+#   Windows — WINDOWS_CERT_BASE64, WINDOWS_CERT_PASSWORD (Authenticode .pfx)
+#            → the portable .exe and the installer are Authenticode-signed
+# Without secrets every step below still runs; signing steps are skipped.
 on:
   push:
     tags: ["v*"]
@@ -27,6 +36,11 @@ jobs:
             target_name: macos-aarch64
           - os: windows-latest
             target_name: windows-x86_64
+    env:
+      # Secrets are not readable in step-level `if:` on forks; funnel presence
+      # checks through job env so steps can gate on them reliably.
+      HAVE_MACOS_CERT: ${{ secrets.MACOS_CERT_BASE64 != '' }}
+      HAVE_WINDOWS_CERT: ${{ secrets.WINDOWS_CERT_BASE64 != '' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -39,7 +53,7 @@ jobs:
             libfontconfig-dev libfreetype6-dev \
             libwayland-dev libxkbcommon-x11-dev \
             libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
-            libssl-dev libvulkan-dev libgl1-mesa-dev
+            libssl-dev libdbus-1-dev libvulkan-dev libgl1-mesa-dev
 
       - name: Install NASM (Windows)
         if: runner.os == 'Windows'
@@ -63,10 +77,103 @@ jobs:
       - name: Build
         run: cargo build -p mmm-app --release --locked
 
-      # ---- Optional code signing (add the secrets, then uncomment) ----------
-      # Windows Authenticode: needs WINDOWS_CERT_BASE64 + WINDOWS_CERT_PASSWORD.
-      # macOS notarization: needs APPLE_CERT_*, APPLE_ID, APPLE_TEAM_ID, etc.
-      # These are intentionally left out so the workflow runs without secrets.
+      # ---- macOS signing + notarization (skipped without secrets) -----------
+
+      - name: Import signing certificate (macOS)
+        if: runner.os == 'macOS' && env.HAVE_MACOS_CERT == 'true'
+        shell: bash
+        env:
+          MACOS_CERT_BASE64: ${{ secrets.MACOS_CERT_BASE64 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+        run: |
+          set -euo pipefail
+          CERT_PATH="$RUNNER_TEMP/devid.p12"
+          KEYCHAIN_PATH="$RUNNER_TEMP/build.keychain-db"
+          KEYCHAIN_PASSWORD="$(uuidgen)"
+
+          echo -n "$MACOS_CERT_BASE64" | base64 --decode > "$CERT_PATH"
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$CERT_PATH" -P "$MACOS_CERT_PASSWORD" \
+            -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple: \
+            -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH" > /dev/null
+          security list-keychains -d user -s "$KEYCHAIN_PATH" login.keychain-db
+
+          IDENTITY=$(security find-identity -v -p codesigning "$KEYCHAIN_PATH" \
+            | awk -F'"' '/Developer ID Application/ {print $2; exit}')
+          if [ -z "$IDENTITY" ]; then
+            echo "::error::No 'Developer ID Application' identity found in the imported .p12"
+            exit 1
+          fi
+          echo "SIGN_IDENTITY=$IDENTITY" >> "$GITHUB_ENV"
+          echo "Using identity: $IDENTITY"
+          rm -f "$CERT_PATH"
+
+      - name: Sign binary and build .app bundle (macOS)
+        if: runner.os == 'macOS' && env.HAVE_MACOS_CERT == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Sign the bare binary too, so the portable tar.gz is also signed.
+          codesign --force --options runtime --timestamp \
+            --sign "$SIGN_IDENTITY" target/release/massfckinmailer
+
+          cargo install cargo-bundle --locked
+          cargo bundle -p mmm-app --release
+          APP="target/release/bundle/osx/MassFckinMailer.app"
+          codesign --force --options runtime --timestamp \
+            --sign "$SIGN_IDENTITY" "$APP"
+          codesign --verify --deep --strict --verbose=2 "$APP"
+          echo "APP_PATH=$APP" >> "$GITHUB_ENV"
+
+      - name: Create, notarize, and staple DMG (macOS)
+        if: runner.os == 'macOS' && env.HAVE_MACOS_CERT == 'true'
+        shell: bash
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          set -euo pipefail
+          DMG="massfckinmailer-${{ matrix.target_name }}.dmg"
+          STAGE="$RUNNER_TEMP/dmg-stage"
+          mkdir -p "$STAGE"
+          cp -R "$APP_PATH" "$STAGE/"
+          ln -s /Applications "$STAGE/Applications"
+          hdiutil create -volname "MassFckinMailer" -srcfolder "$STAGE" \
+            -ov -format UDZO "$DMG"
+          codesign --force --timestamp --sign "$SIGN_IDENTITY" "$DMG"
+
+          # Notarize (this uploads to Apple and waits, typically 1-5 minutes).
+          xcrun notarytool submit "$DMG" \
+            --apple-id "$APPLE_ID" \
+            --team-id "$APPLE_TEAM_ID" \
+            --password "$APPLE_APP_PASSWORD" \
+            --wait
+          xcrun stapler staple "$DMG"
+          xcrun stapler validate "$DMG"
+
+      # ---- Windows Authenticode signing (skipped without secrets) -----------
+
+      - name: Sign binary (Windows)
+        if: runner.os == 'Windows' && env.HAVE_WINDOWS_CERT == 'true'
+        shell: pwsh
+        env:
+          WINDOWS_CERT_BASE64: ${{ secrets.WINDOWS_CERT_BASE64 }}
+          WINDOWS_CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
+        run: |
+          $pfx = Join-Path $env:RUNNER_TEMP "authenticode.pfx"
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WINDOWS_CERT_BASE64))
+          $signtool = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe" |
+            Sort-Object FullName | Select-Object -Last 1
+          & $signtool sign /f $pfx /p $env:WINDOWS_CERT_PASSWORD `
+            /fd SHA256 /td SHA256 /tr http://timestamp.digicert.com `
+            target/release/massfckinmailer.exe
+          & $signtool verify /pa target/release/massfckinmailer.exe
+          Remove-Item $pfx
 
       - name: Package (Unix)
         if: runner.os != 'Windows'
@@ -99,11 +206,36 @@ jobs:
             "/DOutputBase=massfckinmailer-${{ matrix.target_name }}-setup" `
             installer\windows\massfckinmailer.iss
 
+      - name: Sign installer (Windows)
+        if: runner.os == 'Windows' && env.HAVE_WINDOWS_CERT == 'true'
+        shell: pwsh
+        env:
+          WINDOWS_CERT_BASE64: ${{ secrets.WINDOWS_CERT_BASE64 }}
+          WINDOWS_CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
+        run: |
+          $pfx = Join-Path $env:RUNNER_TEMP "authenticode.pfx"
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WINDOWS_CERT_BASE64))
+          $signtool = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe" |
+            Sort-Object FullName | Select-Object -Last 1
+          & $signtool sign /f $pfx /p $env:WINDOWS_CERT_PASSWORD `
+            /fd SHA256 /td SHA256 /tr http://timestamp.digicert.com `
+            "dist/massfckinmailer-${{ matrix.target_name }}-setup.exe"
+          & $signtool verify /pa "dist/massfckinmailer-${{ matrix.target_name }}-setup.exe"
+          Remove-Item $pfx
+
       - name: Upload to GitHub Release (Unix)
         if: runner.os != 'Windows'
         uses: softprops/action-gh-release@v2
         with:
           files: massfckinmailer-${{ matrix.target_name }}.tar.gz
+          draft: true
+          fail_on_unmatched_files: true
+
+      - name: Upload DMG to GitHub Release (macOS, signed builds only)
+        if: runner.os == 'macOS' && env.HAVE_MACOS_CERT == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: massfckinmailer-${{ matrix.target_name }}.dmg
           draft: true
           fail_on_unmatched_files: true
 
@@ -116,3 +248,8 @@ jobs:
             dist/massfckinmailer-${{ matrix.target_name }}-setup.exe
           draft: true
           fail_on_unmatched_files: true
+
+      - name: Clean up keychain (macOS)
+        if: always() && runner.os == 'macOS' && env.HAVE_MACOS_CERT == 'true'
+        shell: bash
+        run: security delete-keychain "$RUNNER_TEMP/build.keychain-db" || true

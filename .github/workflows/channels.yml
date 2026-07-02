@@ -28,19 +28,26 @@ jobs:
     outputs:
       tag: ${{ steps.channel.outputs.tag }}
       title: ${{ steps.channel.outputs.title }}
+      version: ${{ steps.channel.outputs.version }}
     steps:
       - uses: actions/checkout@v4
 
+      # Version = workspace version (Cargo.toml) + channel + build number
+      # (github.run_number), e.g. 0.1.0-nightly.20260703.42. Computed once here
+      # and reused by every build job and the release body.
       - id: channel
         shell: bash
         run: |
+          base=$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
           case "${GITHUB_REF_NAME}" in
-            beta) tag=beta;    title=Beta ;;
-            dev)  tag=nightly; title=Nightly ;;
-            *)    tag="${GITHUB_REF_NAME}"; title="${GITHUB_REF_NAME}" ;;
+            beta) tag=beta;    title=Beta;    ver="${base}-beta.${{ github.run_number }}" ;;
+            dev)  tag=nightly; title=Nightly; ver="${base}-nightly.$(date -u +%Y%m%d).${{ github.run_number }}" ;;
+            *)    tag="${GITHUB_REF_NAME}"; title="${GITHUB_REF_NAME}"; ver="${base}-${GITHUB_REF_NAME}.${{ github.run_number }}" ;;
           esac
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "title=$title" >> "$GITHUB_OUTPUT"
+          echo "version=$ver" >> "$GITHUB_OUTPUT"
+          echo "Version: $ver"
 
       # Point the rolling tag at this commit so the release tracks latest.
       - name: Move rolling tag
@@ -49,8 +56,10 @@ jobs:
           git tag -f "${{ steps.channel.outputs.tag }}"
           git push -f origin "refs/tags/${{ steps.channel.outputs.tag }}"
 
-      # Create/refresh the release shell before the matrix uploads assets,
-      # so the three build jobs don't race to create it.
+      # Create/refresh the release shell before the matrix uploads assets, so the
+      # three build jobs don't race to create it. The first body line is a
+      # machine-readable marker the in-app updater reads (the rolling tag itself
+      # is just `beta`/`nightly`, not a version).
       - name: Ensure release exists
         uses: softprops/action-gh-release@v2
         with:
@@ -58,6 +67,8 @@ jobs:
           name: ${{ steps.channel.outputs.title }} (rolling)
           prerelease: true
           body: |
+            MFM_VERSION=${{ steps.channel.outputs.version }}
+
             Automated ${{ steps.channel.outputs.title }} build from `${{ github.ref_name }}` (${{ github.sha }}).
 
             ⚠️ Pre-release — for testing, not a stable version.
@@ -65,6 +76,9 @@ jobs:
   build:
     name: ${{ matrix.target_name }} (${{ needs.meta.outputs.title }})
     needs: meta
+    # Embedded in the binary (via build.rs) and used by the installer.
+    env:
+      MFM_VERSION: ${{ needs.meta.outputs.version }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -88,7 +102,7 @@ jobs:
             libfontconfig-dev libfreetype6-dev \
             libwayland-dev libxkbcommon-x11-dev \
             libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
-            libssl-dev libvulkan-dev libgl1-mesa-dev
+            libssl-dev libdbus-1-dev libvulkan-dev libgl1-mesa-dev
 
       - name: Install NASM (Windows)
         if: runner.os == 'Windows'
@@ -96,21 +110,6 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-
-      # Version = workspace version (Cargo.toml) + channel + build number
-      # (github.run_number), e.g. 0.1.0-nightly.20260703.42. Embedded in the
-      # binary and used by the installer.
-      - name: Compute version
-        shell: bash
-        run: |
-          base=$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
-          case "${{ needs.meta.outputs.tag }}" in
-            beta)    ver="${base}-beta.${{ github.run_number }}" ;;
-            nightly) ver="${base}-nightly.$(date -u +%Y%m%d).${{ github.run_number }}" ;;
-            *)       ver="${base}-${{ needs.meta.outputs.tag }}.${{ github.run_number }}" ;;
-          esac
-          echo "MFM_VERSION=$ver" >> "$GITHUB_ENV"
-          echo "Version: $ver"
 
       - name: Build
         run: cargo build -p mmm-app --release --locked

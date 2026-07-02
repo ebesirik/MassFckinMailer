@@ -92,8 +92,24 @@ That string is embedded at build time (`MFM_VERSION`, wired through
 the plain `Cargo.toml` version.
 
 No repository secrets are required for any of the above. Code signing /
-notarization is stubbed (commented) in `release.yml` for when you add the
-relevant secrets.
+notarization in `release.yml` activates automatically once you add the
+relevant secrets — the full walkthrough (getting a Developer ID certificate
+from your Apple account, notarization credentials, Windows options) is in
+[docs/SIGNING.md](docs/SIGNING.md). Signed macOS builds additionally ship a
+notarized `.dmg`.
+
+### Auto-update (OTA via GitHub)
+
+The app updates itself over the air using **GitHub Releases as the only backend**
+— no server to run. On startup it asks the public GitHub API for the newest
+release **on its own channel** (inferred from `MFM_VERSION`: stable →
+`/releases/latest`, beta/nightly → the rolling tag), compares with semver, and if
+newer shows a **"Restart & update"** button in the sidebar — notify-and-click, it
+never auto-applies. On click it downloads the matching platform asset, verifies
+its SHA-256 when GitHub supplies a digest, then hands off: **Windows** runs the
+installer silently (it closes, upgrades, and relaunches the app), while
+**Linux/macOS** swap the running binary in place and relaunch. Offline / rate-
+limited checks fail silently. Implementation: `crates/engine/src/update.rs`.
 
 ## OAuth setup (Gmail / Outlook)
 

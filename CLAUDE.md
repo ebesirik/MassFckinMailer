@@ -80,12 +80,26 @@ and producing platform installers. See README for setup + packaging commands.
   (`beta` → "Beta", `dev` → "nightly"): it force-moves the channel tag to the new
   commit and overwrites the per-platform assets. `master` is intentionally excluded.
 - `release.yml` — a `v*` tag builds all platforms into a draft GitHub Release
-  (stable). No secrets required; signing is stubbed/commented.
+  (stable). No secrets required; code signing activates automatically when the
+  signing secrets exist (macOS: sign + notarize + stapled `.dmg`; Windows:
+  Authenticode on exe + installer). Setup walkthrough: `docs/SIGNING.md`.
 - **Version**: single source is `[workspace.package] version` in `Cargo.toml`.
   Pipelines compute `MFM_VERSION` (base + channel + Actions run number) and pass
   it to the build; `crates/app/build.rs` embeds it via `env!("MFM_VERSION")`
   (falling back to the crate version locally), shown as `APP_VERSION` in the
   sidebar. Bump the version in one place — `Cargo.toml`.
+
+## Auto-update (OTA)
+
+`crates/engine/src/update.rs` implements over-the-air updates with **GitHub
+Releases as the only backend** (no server). The channel is inferred from
+`MFM_VERSION` (stable → `/releases/latest`; beta/nightly → the rolling tag);
+channel releases carry the exact version in an `MFM_VERSION=…` body marker
+(the tag is just `beta`/`nightly`). The app checks on startup via
+`Command::CheckUpdate` and shows a notify-and-click banner (`Command::ApplyUpdate`).
+Apply: Windows runs the Inno installer silently (`.iss` has `CloseApplications=yes`
+so it can replace the running exe, then relaunches); other platforms `self_replace`
+the binary. SHA-256 is verified when GitHub supplies an asset digest.
 
 ## Status
 
