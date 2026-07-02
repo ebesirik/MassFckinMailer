@@ -4,17 +4,30 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+/// UI theme preference. `Auto` follows the operating system's light/dark setting.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThemePref {
+    Light,
+    Dark,
+    #[default]
+    Auto,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AppSettings {
     /// BCP-47-ish locale code, e.g. `en`, `tr`, `pt`.
     #[serde(default = "default_language")]
     pub language: String,
+    #[serde(default)]
+    pub theme: ThemePref,
 }
 
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
             language: default_language(),
+            theme: ThemePref::default(),
         }
     }
 }

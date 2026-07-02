@@ -5,7 +5,7 @@ use std::rc::Rc;
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_component::{
-    ActiveTheme, Disableable as _, Icon, IconName, Selectable as _, h_flex,
+    ActiveTheme, Disableable as _, Icon, IconName, Selectable as _, Theme, ThemeMode, h_flex,
     button::{Button, ButtonVariants as _},
     input::{Input, InputState},
     progress::Progress,
@@ -19,7 +19,7 @@ use mmm_core::project::{
     AccountRef, CURRENT_VERSION, PROJECT_SUFFIX, Project, RecentProjects, RecipientSource,
     SendingConfig, TemplateSpec,
 };
-use mmm_core::settings::AppSettings;
+use mmm_core::settings::{AppSettings, ThemePref};
 use mmm_core::template::{self, extract_placeholders, normalize_placeholders};
 use rust_i18n::t;
 
@@ -349,6 +349,10 @@ pub struct MainWindow {
 
     /// Current UI language code (mirrors the global rust-i18n locale).
     language: String,
+    /// Light / Dark / Auto (follow system).
+    theme_pref: ThemePref,
+    /// Kept alive so system-appearance changes keep firing (Auto mode).
+    _appearance_sub: Subscription,
 }
 
 fn read_trimmed(input: &Entity<InputState>, cx: &App) -> String {
@@ -381,6 +385,16 @@ impl MainWindow {
         let store = AccountStore::load().unwrap_or_default();
         let form = AccountForm::new(window, cx);
         let template = TemplateForm::new(window, cx);
+
+        // Apply the saved theme before first paint, and follow the OS appearance
+        // while in Auto mode.
+        let settings = AppSettings::load();
+        apply_theme_mode(settings.theme, window, cx);
+        let appearance_sub = cx.observe_window_appearance(window, |this, window, cx| {
+            if this.theme_pref == ThemePref::Auto {
+                this.apply_theme(window, cx);
+            }
+        });
 
         let sc = SendingConfig::default();
         let send_mps =
@@ -417,17 +431,35 @@ impl MainWindow {
             saved_snapshot: ProjectSnapshot::fresh(),
             recents: RecentProjects::load(),
             project_notice: None,
-            language: AppSettings::load().language,
+            language: settings.language,
+            theme_pref: settings.theme,
+            _appearance_sub: appearance_sub,
         }
+    }
+
+    fn apply_theme(&self, window: &mut Window, cx: &mut App) {
+        apply_theme_mode(self.theme_pref, window, cx);
+    }
+
+    fn save_settings(&self) {
+        let _ = AppSettings {
+            language: self.language.clone(),
+            theme: self.theme_pref,
+        }
+        .save();
+    }
+
+    fn on_set_theme(&mut self, pref: ThemePref, window: &mut Window, cx: &mut Context<Self>) {
+        self.theme_pref = pref;
+        apply_theme_mode(pref, window, cx);
+        self.save_settings();
+        cx.notify();
     }
 
     fn on_set_language(&mut self, code: &str, cx: &mut Context<Self>) {
         self.language = code.to_string();
         rust_i18n::set_locale(code);
-        let _ = AppSettings {
-            language: code.to_string(),
-        }
-        .save();
+        self.save_settings();
         cx.notify();
     }
 
@@ -2781,6 +2813,7 @@ impl MainWindow {
                         h_flex()
                             .gap_2()
                             .items_center()
+                            .child(self.render_theme_picker(cx))
                             .child(self.render_language_picker(cx))
                             .child(
                                 Button::new("proj-new")
@@ -2843,6 +2876,41 @@ impl MainWindow {
             .children(chips)
     }
 
+    fn render_theme_picker(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        h_flex()
+            .gap_1()
+            .child(
+                Button::new("theme-light")
+                    .ghost()
+                    .icon(IconName::Sun)
+                    .tooltip(tr("theme.light"))
+                    .selected(self.theme_pref == ThemePref::Light)
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.on_set_theme(ThemePref::Light, window, cx)
+                    })),
+            )
+            .child(
+                Button::new("theme-dark")
+                    .ghost()
+                    .icon(IconName::Moon)
+                    .tooltip(tr("theme.dark"))
+                    .selected(self.theme_pref == ThemePref::Dark)
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.on_set_theme(ThemePref::Dark, window, cx)
+                    })),
+            )
+            .child(
+                Button::new("theme-auto")
+                    .ghost()
+                    .label(tr("theme.auto"))
+                    .tooltip(tr("theme.auto_tip"))
+                    .selected(self.theme_pref == ThemePref::Auto)
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.on_set_theme(ThemePref::Auto, window, cx)
+                    })),
+            )
+    }
+
     fn render_language_picker(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let mut chips = Vec::new();
         for (code, label) in LANGUAGES {
@@ -2857,6 +2925,17 @@ impl MainWindow {
         }
         h_flex().gap_1().children(chips)
     }
+}
+
+/// Resolve a [`ThemePref`] to a concrete light/dark mode and apply it. `Auto`
+/// maps the OS window appearance.
+fn apply_theme_mode(pref: ThemePref, window: &mut Window, cx: &mut App) {
+    let mode = match pref {
+        ThemePref::Light => ThemeMode::Light,
+        ThemePref::Dark => ThemeMode::Dark,
+        ThemePref::Auto => ThemeMode::from(window.appearance()),
+    };
+    Theme::change(mode, Some(window), cx);
 }
 
 /// The campaign base name from a project path: strips the `.mmproj.toml`

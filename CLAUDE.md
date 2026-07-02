@@ -47,6 +47,10 @@ cargo run -p mmm-app --example gen_icon     # regenerate assets/icon.{png,ico}
   gpui's `background_executor`. Never block the UI thread.
 - **Secrets** live only in the OS keychain (`providers::secrets`), keyed by
   account id. `accounts.toml` and project files hold non-secret references only.
+- **Preferences** (UI language + theme) persist via `core::settings::AppSettings`
+  to `{config_dir}/massfckinmailer/settings.toml`. Theme is Light / Dark / Auto;
+  Auto follows the OS via `window.appearance()` + `observe_window_appearance`, and
+  is applied with gpui-component's `Theme::change`.
 - **i18n.** rust-i18n; all user-facing text goes through `t!` / the `tr(key)`
   helper. Strings live in `crates/app/locales/app.yml` (`_version: 2`,
   12 languages, English is the fallback). Helper fns like `field_label`,
