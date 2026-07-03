@@ -1,3 +1,8 @@
+// Launch as a Windows GUI app in release builds so double-clicking the exe (or
+// the installer's shortcut) doesn't flash/keep a console window. Debug builds
+// keep the console so panics and logs stay visible during development.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod assets;
 mod main_window;
 mod theme;

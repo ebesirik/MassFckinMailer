@@ -125,6 +125,24 @@ jobs:
           cp README.md LICENSE-MIT LICENSE-APACHE "$staging"/
           tar czf "$staging.tar.gz" "$staging"
 
+      # Also ship a real macOS .app inside a .dmg (unsigned — channel builds
+      # have no signing secrets, so Gatekeeper needs a right-click → Open). The
+      # .tar.gz above stays for the OTA updater, which self-replaces the binary.
+      - name: Build .app + DMG (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo install cargo-bundle --locked
+          cargo bundle -p mmm-app --release
+          DMG="massfckinmailer-${{ matrix.target_name }}.dmg"
+          STAGE="$RUNNER_TEMP/dmg-stage"
+          mkdir -p "$STAGE"
+          cp -R "target/release/bundle/osx/MassFckinMailer.app" "$STAGE/"
+          ln -s /Applications "$STAGE/Applications"
+          hdiutil create -volname "MassFckinMailer" -srcfolder "$STAGE" \
+            -ov -format UDZO "$DMG"
+
       - name: Package portable zip (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
@@ -152,6 +170,14 @@ jobs:
         with:
           tag_name: ${{ needs.meta.outputs.tag }}
           files: massfckinmailer-${{ matrix.target_name }}.tar.gz
+          fail_on_unmatched_files: true
+
+      - name: Publish DMG (macOS)
+        if: runner.os == 'macOS'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.meta.outputs.tag }}
+          files: massfckinmailer-${{ matrix.target_name }}.dmg
           fail_on_unmatched_files: true
 
       - name: Publish assets (Windows)

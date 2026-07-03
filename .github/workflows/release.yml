@@ -112,7 +112,19 @@ jobs:
           echo "Using identity: $IDENTITY"
           rm -f "$CERT_PATH"
 
-      - name: Sign binary and build .app bundle (macOS)
+      # Always build the .app so macOS ships a real app bundle (no Terminal
+      # window), even without signing secrets. Signing/notarization is layered
+      # on below only when the cert is present.
+      - name: Build .app bundle (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo install cargo-bundle --locked
+          cargo bundle -p mmm-app --release
+          echo "APP_PATH=target/release/bundle/osx/MassFckinMailer.app" >> "$GITHUB_ENV"
+
+      - name: Sign binary and .app bundle (macOS)
         if: runner.os == 'macOS' && env.HAVE_MACOS_CERT == 'true'
         shell: bash
         run: |
@@ -120,22 +132,14 @@ jobs:
           # Sign the bare binary too, so the portable tar.gz is also signed.
           codesign --force --options runtime --timestamp \
             --sign "$SIGN_IDENTITY" target/release/massfckinmailer
-
-          cargo install cargo-bundle --locked
-          cargo bundle -p mmm-app --release
-          APP="target/release/bundle/osx/MassFckinMailer.app"
           codesign --force --options runtime --timestamp \
-            --sign "$SIGN_IDENTITY" "$APP"
-          codesign --verify --deep --strict --verbose=2 "$APP"
-          echo "APP_PATH=$APP" >> "$GITHUB_ENV"
+            --sign "$SIGN_IDENTITY" "$APP_PATH"
+          codesign --verify --deep --strict --verbose=2 "$APP_PATH"
 
-      - name: Create, notarize, and staple DMG (macOS)
-        if: runner.os == 'macOS' && env.HAVE_MACOS_CERT == 'true'
+      # Always package the .app into a .dmg (unsigned when no cert).
+      - name: Create DMG (macOS)
+        if: runner.os == 'macOS'
         shell: bash
-        env:
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
         run: |
           set -euo pipefail
           DMG="massfckinmailer-${{ matrix.target_name }}.dmg"
@@ -145,6 +149,17 @@ jobs:
           ln -s /Applications "$STAGE/Applications"
           hdiutil create -volname "MassFckinMailer" -srcfolder "$STAGE" \
             -ov -format UDZO "$DMG"
+
+      - name: Sign, notarize, and staple DMG (macOS)
+        if: runner.os == 'macOS' && env.HAVE_MACOS_CERT == 'true'
+        shell: bash
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          set -euo pipefail
+          DMG="massfckinmailer-${{ matrix.target_name }}.dmg"
           codesign --force --timestamp --sign "$SIGN_IDENTITY" "$DMG"
 
           # Notarize (this uploads to Apple and waits, typically 1-5 minutes).
@@ -231,8 +246,8 @@ jobs:
           draft: true
           fail_on_unmatched_files: true
 
-      - name: Upload DMG to GitHub Release (macOS, signed builds only)
-        if: runner.os == 'macOS' && env.HAVE_MACOS_CERT == 'true'
+      - name: Upload DMG to GitHub Release (macOS)
+        if: runner.os == 'macOS'
         uses: softprops/action-gh-release@v2
         with:
           files: massfckinmailer-${{ matrix.target_name }}.dmg
