@@ -5,15 +5,20 @@ use std::rc::Rc;
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_component::{
-    ActiveTheme, Disableable as _, Icon, IconName, Selectable as _, Theme, ThemeMode,
+    ActiveTheme, Disableable as _, Icon, IconName, Selectable as _, Sizable as _, Theme, ThemeMode,
+    TitleBar,
     button::{Button, ButtonVariants as _},
+    divider::Divider,
     h_flex,
     input::{Input, InputState},
+    popover::Popover,
     progress::Progress,
-    sidebar::{Sidebar, SidebarGroup, SidebarHeader, SidebarMenu, SidebarMenuItem},
+    switch::Switch,
     text::TextView,
     v_flex,
 };
+
+use crate::theme::{self, ActiveTokens as _};
 use mmm_core::import::{self, RecipientTable, SourceKind, is_email};
 use mmm_core::mapping::{self, RowStatus, ValidationReport};
 use mmm_core::project::{
@@ -167,6 +172,8 @@ struct ResumeInfo {
 /// entities must be owned by the view so they stay alive across renders.
 struct AccountForm {
     open: bool,
+    /// `Some(id)` when editing an existing account in place (Save reuses the id).
+    editing: Option<String>,
     kind: ProviderKind,
     tls: TlsMode,
     region: MailgunRegion,
@@ -204,6 +211,7 @@ impl AccountForm {
 
         Self {
             open: false,
+            editing: None,
             kind: ProviderKind::Smtp,
             tls: TlsMode::StartTls,
             region: MailgunRegion::Us,
@@ -353,6 +361,10 @@ pub struct MainWindow {
     language: String,
     /// Light / Dark / Auto (follow system).
     theme_pref: ThemePref,
+    /// Title-bar language dropdown open state (controlled `Popover`).
+    lang_menu_open: bool,
+    /// Title-bar Open/recents dropdown open state (controlled `Popover`).
+    open_menu_open: bool,
     /// Kept alive so system-appearance changes keep firing (Auto mode).
     _appearance_sub: Subscription,
 
@@ -367,6 +379,16 @@ pub struct MainWindow {
 
 fn read_trimmed(input: &Entity<InputState>, cx: &App) -> String {
     input.read(cx).value().trim().to_string()
+}
+
+/// Replace the text of an input field (used to pre-fill the edit form).
+fn set_input(
+    input: &Entity<InputState>,
+    value: impl Into<SharedString>,
+    window: &mut Window,
+    cx: &mut Context<MainWindow>,
+) {
+    input.update(cx, |state, cx| state.set_value(value, window, cx));
 }
 
 impl MainWindow {
@@ -450,6 +472,8 @@ impl MainWindow {
             project_notice: None,
             language: settings.language,
             theme_pref: settings.theme,
+            lang_menu_open: false,
+            open_menu_open: false,
             _appearance_sub: appearance_sub,
             available_update: None,
             update_applying: false,
@@ -549,6 +573,7 @@ impl MainWindow {
                             return;
                         }
                         self.form.open = false;
+                        self.form.editing = None;
                     }
                     let _ = message;
                     self.notice = Some(Notice {
@@ -774,7 +799,8 @@ impl MainWindow {
     }
 
     fn on_connect_oauth(&mut self, cx: &mut Context<Self>) {
-        match self.form_to_account(new_account_id(), cx) {
+        let id = self.form.editing.clone().unwrap_or_else(new_account_id);
+        match self.form_to_account(id, cx) {
             Ok((account, client_secret)) => {
                 self.pending_oauth = Some(account.clone());
                 self.testing = true;
@@ -793,7 +819,7 @@ impl MainWindow {
     }
 
     fn on_save_account(&mut self, cx: &mut Context<Self>) {
-        let id = new_account_id();
+        let id = self.form.editing.clone().unwrap_or_else(new_account_id);
         match self.form_to_account(id.clone(), cx) {
             Ok((account, secret)) => {
                 if let Err(e) = secrets::set(&account.id, &secret) {
@@ -814,6 +840,7 @@ impl MainWindow {
                     return;
                 }
                 self.form.open = false;
+                self.form.editing = None;
                 self.notice = Some(Notice {
                     ok: true,
                     text: tr("acct.saved"),
@@ -832,6 +859,56 @@ impl MainWindow {
                 ok: false,
                 text: format!("Failed to update accounts file: {e}"),
             });
+        }
+        cx.notify();
+    }
+
+    /// Open the form pre-filled from an existing account to edit it in place.
+    /// Secrets aren't read back from the keychain, so they're re-entered on save.
+    fn begin_edit(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(account) = self.store.get(&id).cloned() else {
+            return;
+        };
+        self.form.open = true;
+        self.form.editing = Some(account.id.clone());
+        self.notice = None;
+        set_input(&self.form.display, account.display.clone(), window, cx);
+        match &account.config {
+            AccountConfig::Smtp(c) => {
+                self.form.kind = ProviderKind::Smtp;
+                self.form.tls = c.tls;
+                set_input(&self.form.smtp_host, c.host.clone(), window, cx);
+                set_input(&self.form.smtp_port, c.port.to_string(), window, cx);
+                set_input(&self.form.smtp_username, c.username.clone(), window, cx);
+                set_input(&self.form.smtp_from, c.from.clone(), window, cx);
+                set_input(&self.form.smtp_password, "", window, cx);
+            }
+            AccountConfig::Mailgun(c) => {
+                self.form.kind = ProviderKind::Mailgun;
+                self.form.region = c.region;
+                set_input(&self.form.mg_domain, c.domain.clone(), window, cx);
+                set_input(&self.form.mg_from, c.from.clone(), window, cx);
+                set_input(&self.form.mg_api_key, "", window, cx);
+            }
+            AccountConfig::Ses(c) => {
+                self.form.kind = ProviderKind::Ses;
+                set_input(&self.form.ses_region, c.region.clone(), window, cx);
+                set_input(&self.form.ses_from, c.from.clone(), window, cx);
+                set_input(&self.form.ses_key_id, "", window, cx);
+                set_input(&self.form.ses_secret, "", window, cx);
+            }
+            AccountConfig::Gmail(c) => {
+                self.form.kind = ProviderKind::Gmail;
+                set_input(&self.form.oauth_from, c.from.clone(), window, cx);
+                set_input(&self.form.oauth_client_id, c.client_id.clone(), window, cx);
+                set_input(&self.form.oauth_client_secret, "", window, cx);
+            }
+            AccountConfig::Outlook(c) => {
+                self.form.kind = ProviderKind::Outlook;
+                set_input(&self.form.oauth_from, c.from.clone(), window, cx);
+                set_input(&self.form.oauth_client_id, c.client_id.clone(), window, cx);
+                set_input(&self.form.oauth_tenant, c.tenant.clone(), window, cx);
+            }
         }
         cx.notify();
     }
@@ -1073,104 +1150,199 @@ impl MainWindow {
     }
 
     fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        Sidebar::left()
-            .w(px(220.))
-            .header(
-                SidebarHeader::new()
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .size_8()
-                            .flex_shrink_0()
-                            .rounded(cx.theme().radius)
-                            .bg(cx.theme().primary)
-                            .text_color(cx.theme().primary_foreground)
-                            .child(Icon::new(IconName::Inbox)),
-                    )
+        let faint = cx.tokens().text_faint;
+        v_flex()
+            .w(px(264.))
+            .flex_shrink_0()
+            .h_full()
+            .bg(cx.theme().sidebar)
+            .border_r_1()
+            .border_color(cx.theme().border)
+            .px(px(14.))
+            .py(px(20.))
+            .gap(px(22.))
+            // Identity block.
+            .child(
+                h_flex()
+                    .items_center()
+                    .gap(px(12.))
+                    .child(self.app_mark(px(42.), px(20.), px(12.), cx))
                     .child(
                         v_flex()
-                            .flex_1()
+                            .gap(px(2.))
                             .overflow_hidden()
-                            .child("MassFckinMailer")
-                            .child(div().text_xs().child(tr("nav.subtitle")))
                             .child(
                                 div()
-                                    .text_xs()
+                                    .text_size(px(15.))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child("MassFckinMailer"),
+                            )
+                            .child(
+                                h_flex()
+                                    .gap(px(4.))
+                                    .text_size(px(12.))
                                     .text_color(cx.theme().muted_foreground)
-                                    .child(format!("v{APP_VERSION}")),
+                                    .child(tr("nav.subtitle"))
+                                    .child(
+                                        div()
+                                            .font_family(theme::MONO_FONT)
+                                            .text_size(px(11.))
+                                            .text_color(faint)
+                                            .child(format!("· v{APP_VERSION}")),
+                                    ),
                             ),
                     ),
             )
+            // Steps.
             .child(
-                SidebarGroup::new("Steps").child(SidebarMenu::new().children(Section::ALL.map(
-                    |section| {
-                        let status = self.step_status(section, cx);
-                        let mut item = SidebarMenuItem::new(tr(section.label_key()))
-                            .icon(section.icon())
-                            .active(self.active == section)
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.active = section;
-                                cx.notify();
-                            }));
-                        if let Some((icon, color)) = status {
-                            item = item.suffix(div().text_color(color).child(Icon::new(icon)));
-                        }
-                        item
-                    },
-                ))),
+                v_flex()
+                    .gap(px(3.))
+                    .child(
+                        div()
+                            .px(px(8.))
+                            .pb(px(4.))
+                            .text_size(px(11.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(faint)
+                            .child(tr("nav.steps").to_uppercase()),
+                    )
+                    .children(Section::ALL.map(|section| self.step_row(section, cx))),
             )
-            .footer(self.render_update_banner(cx))
+            // Push the update banner to the bottom.
+            .child(div().flex_1())
+            .child(self.render_update_banner(cx))
+    }
+
+    /// One wizard step row: leading icon + label (flex) + trailing status check.
+    fn step_row(&self, section: Section, cx: &mut Context<Self>) -> AnyElement {
+        let active = self.active == section;
+        let status = self.step_status(section, cx);
+        let accent = cx.theme().primary;
+        let soft = cx.tokens().accent_soft;
+        let surface_2 = cx.tokens().surface_2;
+        let text = cx.theme().foreground;
+
+        h_flex()
+            .id(SharedString::from(format!("step-{}", section.label_key())))
+            .items_center()
+            .gap(px(11.))
+            .px(px(11.))
+            .py(px(9.))
+            .rounded(px(10.))
+            .cursor_pointer()
+            .when(active, |this| this.bg(soft).text_color(accent))
+            .when(!active, |this| {
+                this.text_color(text).hover(|h| h.bg(surface_2))
+            })
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.active = section;
+                cx.notify();
+            }))
+            .child(Icon::new(section.icon()).with_size(px(18.)))
+            .child(
+                div()
+                    .flex_1()
+                    .text_size(px(14.))
+                    .when(active, |this| this.font_weight(FontWeight::SEMIBOLD))
+                    .child(tr(section.label_key())),
+            )
+            .when_some(status, |this, (icon, color)| {
+                this.child(
+                    div()
+                        .flex_shrink_0()
+                        .text_color(color)
+                        .child(Icon::new(icon).with_size(px(15.))),
+                )
+            })
+            .into_any_element()
     }
 
     fn render_content(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let section = self.active;
-        v_flex()
+        div()
+            .id("content-scroll")
             .flex_1()
-            .gap_4()
-            .p_8()
-            .child(div().text_xl().child(tr(section.label_key())))
+            .h_full()
+            .min_w(px(0.))
+            .overflow_y_scroll()
             .child(
-                div()
-                    .text_color(cx.theme().muted_foreground)
-                    .max_w(px(620.))
-                    .child(tr(section.hint_key())),
+                v_flex()
+                    .w_full()
+                    .max_w(px(880.))
+                    .mx_auto()
+                    .px(px(44.))
+                    .pt(px(38.))
+                    .pb(px(72.))
+                    .gap(px(24.))
+                    .child(
+                        v_flex()
+                            .gap(px(8.))
+                            .child(
+                                div()
+                                    .text_size(px(26.))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child(tr(section.label_key())),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(15.))
+                                    .text_color(cx.theme().muted_foreground)
+                                    .max_w(px(640.))
+                                    .child(tr(section.hint_key())),
+                            ),
+                    )
+                    .when(section == Section::Accounts, |this| {
+                        this.child(self.render_accounts(cx))
+                    })
+                    .when(section == Section::Template, |this| {
+                        this.child(self.render_template(window, cx))
+                    })
+                    .when(section == Section::Recipients, |this| {
+                        this.child(self.render_recipients(cx))
+                    })
+                    .when(section == Section::Send, |this| {
+                        this.child(self.render_send(cx))
+                    }),
             )
-            .when(section == Section::Accounts, |this| {
-                this.child(self.render_accounts(cx))
-            })
-            .when(section == Section::Template, |this| {
-                this.child(self.render_template(window, cx))
-            })
-            .when(section == Section::Recipients, |this| {
-                this.child(self.render_recipients(cx))
-            })
-            .when(section == Section::Send, |this| {
-                this.child(self.render_send(cx))
-            })
     }
 
     // ---- Accounts UI ----------------------------------------------------
 
     fn render_accounts(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let accent = cx.theme().primary;
         v_flex()
-            .gap_4()
-            .max_w(px(620.))
+            .gap(px(12.))
             .child(self.render_account_list(cx))
             .when(!self.form.open, |this| {
                 this.child(
-                    h_flex().child(
-                        Button::new("add-account")
-                            .primary()
-                            .icon(IconName::Plus)
-                            .label(tr("acct.add"))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.form.open = true;
-                                this.notice = None;
-                                cx.notify();
-                            })),
-                    ),
+                    div()
+                        .id("add-account")
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .gap(px(8.))
+                        .w_full()
+                        .py(px(14.))
+                        .rounded(px(12.))
+                        .border_1()
+                        .border_dashed()
+                        .border_color(cx.tokens().border_strong)
+                        .text_color(cx.theme().foreground)
+                        .cursor_pointer()
+                        .hover(move |h| h.border_color(accent).text_color(accent))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.form.editing = None;
+                            this.form.open = true;
+                            this.notice = None;
+                            cx.notify();
+                        }))
+                        .child(Icon::new(IconName::Plus).with_size(px(16.)))
+                        .child(
+                            div()
+                                .text_size(px(14.))
+                                .font_weight(FontWeight::MEDIUM)
+                                .child(tr("acct.add")),
+                        ),
                 )
             })
             .when(self.form.open, |this| {
@@ -1180,9 +1352,9 @@ impl MainWindow {
 
     fn render_account_list(&self, cx: &mut Context<Self>) -> impl IntoElement {
         if self.store.accounts.is_empty() {
-            return v_flex().gap_2().child(
+            return v_flex().child(
                 div()
-                    .text_sm()
+                    .text_size(px(14.))
                     .text_color(cx.theme().muted_foreground)
                     .child(tr("acct.empty")),
             );
@@ -1190,6 +1362,8 @@ impl MainWindow {
 
         let rows = self.store.accounts.iter().map(|account| {
             let id = account.id.clone();
+            let id_edit = id.clone();
+            let id_del = id.clone();
             let detail = match &account.config {
                 AccountConfig::Smtp(c) => format!("SMTP · {}:{}", c.host, c.port),
                 AccountConfig::Mailgun(c) => format!("Mailgun · {}", c.domain),
@@ -1197,51 +1371,117 @@ impl MainWindow {
                 AccountConfig::Gmail(c) => format!("Gmail · {}", c.from),
                 AccountConfig::Outlook(c) => format!("Outlook · {}", c.from),
             };
-            h_flex()
+            card(cx)
+                .flex()
                 .items_center()
-                .justify_between()
-                .gap_3()
-                .p_3()
-                .rounded(cx.theme().radius)
-                .border_1()
-                .border_color(cx.theme().border)
+                .gap(px(14.))
+                .px(px(18.))
+                .py(px(16.))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .size(px(42.))
+                        .flex_shrink_0()
+                        .rounded(px(11.))
+                        .bg(cx.tokens().accent_soft)
+                        .text_color(cx.theme().primary)
+                        .child(Icon::empty().path("icons/mail.svg").with_size(px(20.))),
+                )
                 .child(
                     v_flex()
-                        .gap_1()
-                        .child(div().text_sm().child(account.display.clone()))
+                        .flex_1()
+                        .min_w(px(0.))
+                        .gap(px(2.))
                         .child(
                             div()
-                                .text_xs()
+                                .text_size(px(15.))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child(account.display.clone()),
+                        )
+                        .child(
+                            div()
+                                .font_family(theme::MONO_FONT)
+                                .text_size(px(12.5))
                                 .text_color(cx.theme().muted_foreground)
+                                .truncate()
                                 .child(detail),
                         ),
                 )
                 .child(
-                    Button::new(SharedString::from(format!("del-{id}")))
-                        .ghost()
-                        .icon(IconName::Delete)
-                        .tooltip(tr("acct.remove"))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.on_delete_account(id.clone(), cx);
-                        })),
+                    h_flex()
+                        .gap(px(5.))
+                        .flex_shrink_0()
+                        .child(
+                            icon_btn(
+                                SharedString::from(format!("edit-{id}")),
+                                "icons/pencil.svg",
+                                false,
+                                cx,
+                            )
+                            .on_click(cx.listener(
+                                move |this, _, window, cx| {
+                                    this.begin_edit(id_edit.clone(), window, cx)
+                                },
+                            )),
+                        )
+                        .child(
+                            icon_btn(
+                                SharedString::from(format!("del-{id}")),
+                                "icons/trash.svg",
+                                true,
+                                cx,
+                            )
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| this.on_delete_account(id_del.clone(), cx),
+                            )),
+                        ),
                 )
         });
 
-        v_flex().gap_2().children(rows)
+        v_flex().gap(px(12.)).children(rows)
     }
 
     fn render_account_form(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let kind = self.form.kind;
         let is_oauth = matches!(kind, ProviderKind::Gmail | ProviderKind::Outlook);
 
-        v_flex()
-            .gap_4()
-            .p_4()
-            .rounded(cx.theme().radius)
-            .border_1()
-            .border_color(cx.theme().border)
-            .bg(cx.theme().secondary)
-            .child(div().text_sm().child(tr("acct.new")))
+        let editing = self.form.editing.is_some();
+        card(cx)
+            .flex()
+            .flex_col()
+            .gap(px(18.))
+            .p(px(22.))
+            .child(
+                h_flex()
+                    .items_center()
+                    .gap(px(10.))
+                    .child(
+                        div()
+                            .text_size(px(15.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(if editing {
+                                tr("acct.edit_title")
+                            } else {
+                                tr("acct.new")
+                            }),
+                    )
+                    .child(div().flex_1())
+                    .child(
+                        Button::new("close-form")
+                            .ghost()
+                            .small()
+                            .icon(IconName::Close)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.form.open = false;
+                                this.form.editing = None;
+                                this.notice = None;
+                                this.pending_oauth = None;
+                                cx.notify();
+                            })),
+                    ),
+            )
             .child(
                 v_flex()
                     .gap_1()
@@ -1347,6 +1587,7 @@ impl MainWindow {
                             .label(tr("common.cancel"))
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.form.open = false;
+                                this.form.editing = None;
                                 this.notice = None;
                                 this.pending_oauth = None;
                                 cx.notify();
@@ -1537,30 +1778,37 @@ impl MainWindow {
 
     fn render_template(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         v_flex()
-            .gap_4()
-            .size_full()
+            .gap(px(22.))
+            .w_full()
             .child(labeled("tmpl.subject", &self.template.subject, cx))
             .child(self.render_placeholder_chips(cx))
             .child(
                 h_flex()
-                    .gap_4()
+                    .gap(px(20.))
                     .w_full()
                     .items_start()
                     .child(
                         v_flex()
-                            .gap_1()
+                            .gap(px(8.))
                             .flex_1()
+                            .min_w(px(0.))
                             .child(field_label("tmpl.body", cx))
                             .child(
                                 div()
-                                    .h(px(440.))
+                                    .h(px(400.))
+                                    .w_full()
+                                    .rounded(px(12.))
+                                    .border_1()
+                                    .border_color(cx.theme().border)
+                                    .overflow_hidden()
                                     .child(Input::new(&self.template.body).h_full()),
                             ),
                     )
                     .child(
                         v_flex()
-                            .gap_1()
+                            .gap(px(8.))
                             .flex_1()
+                            .min_w(px(0.))
                             .child(self.render_preview_nav(cx))
                             .child(self.render_preview_body(window, cx)),
                     ),
@@ -1574,29 +1822,43 @@ impl MainWindow {
         };
         if headers.is_empty() {
             return div()
-                .text_xs()
+                .text_size(px(13.))
                 .text_color(cx.theme().muted_foreground)
                 .child(tr("tmpl.chips_hint"))
                 .into_any_element();
         }
 
+        let accent = cx.theme().primary;
+        let surface_2 = cx.tokens().surface_2;
+        let border = cx.theme().border;
         let mut row = h_flex()
-            .gap_2()
+            .gap(px(8.))
             .flex_wrap()
             .items_center()
             .child(field_label("tmpl.insert", cx));
         for (i, header) in headers.iter().enumerate() {
             let insert = format!("{{{{{}}}}}", template::to_placeholder_ident(header));
             row = row.child(
-                Button::new(SharedString::from(format!("chip-{i}")))
-                    .label(header.clone())
+                div()
+                    .id(SharedString::from(format!("chip-{i}")))
+                    .px(px(11.))
+                    .py(px(5.))
+                    .rounded(px(8.))
+                    .bg(surface_2)
+                    .border_1()
+                    .border_color(border)
+                    .font_family(theme::MONO_FONT)
+                    .text_size(px(13.))
+                    .cursor_pointer()
+                    .hover(move |h| h.border_color(accent).text_color(accent))
                     .on_click(cx.listener(move |this, _, window, cx| {
                         let text = insert.clone();
                         this.template
                             .body
                             .update(cx, |state, cx| state.insert(text, window, cx));
                         cx.notify();
-                    })),
+                    }))
+                    .child(header.clone()),
             );
         }
         row.into_any_element()
@@ -1604,45 +1866,46 @@ impl MainWindow {
 
     fn render_preview_nav(&self, cx: &mut Context<Self>) -> AnyElement {
         let total = self.loaded_row_count();
+        let row = h_flex()
+            .items_center()
+            .gap(px(8.))
+            .w_full()
+            .child(field_label("tmpl.preview", cx))
+            .child(div().flex_1());
         if total == 0 {
-            return h_flex()
-                .gap_2()
-                .items_center()
-                .child(field_label("tmpl.preview", cx))
+            return row
                 .child(
                     div()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
+                        .text_size(px(12.5))
+                        .text_color(cx.tokens().text_faint)
                         .child(tr("tmpl.preview_nodata")),
                 )
                 .into_any_element();
         }
         let current = self.preview_row.min(total - 1) + 1;
-        h_flex()
-            .gap_2()
-            .items_center()
-            .child(field_label("tmpl.preview", cx))
-            .child(
-                Button::new("prev-row")
-                    .ghost()
-                    .label(tr("common.prev"))
-                    .disabled(self.preview_row == 0)
-                    .on_click(cx.listener(|this, _, _, cx| this.preview_prev(cx))),
-            )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(t!("tmpl.row_of", current = current, total = total).to_string()),
-            )
-            .child(
-                Button::new("next-row")
-                    .ghost()
-                    .label(tr("common.next"))
-                    .disabled(self.preview_row + 1 >= total)
-                    .on_click(cx.listener(|this, _, _, cx| this.preview_next(cx))),
-            )
-            .into_any_element()
+        row.child(
+            Button::new("prev-row")
+                .ghost()
+                .small()
+                .label(tr("common.prev"))
+                .disabled(self.preview_row == 0)
+                .on_click(cx.listener(|this, _, _, cx| this.preview_prev(cx))),
+        )
+        .child(
+            div()
+                .text_size(px(12.5))
+                .text_color(cx.theme().muted_foreground)
+                .child(t!("tmpl.row_of", current = current, total = total).to_string()),
+        )
+        .child(
+            Button::new("next-row")
+                .ghost()
+                .small()
+                .label(tr("common.next"))
+                .disabled(self.preview_row + 1 >= total)
+                .on_click(cx.listener(|this, _, _, cx| this.preview_next(cx))),
+        )
+        .into_any_element()
     }
 
     fn render_preview_body(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1668,16 +1931,18 @@ impl MainWindow {
         };
 
         v_flex()
-            .h(px(440.))
-            .gap_2()
-            .p_3()
-            .rounded(cx.theme().radius)
+            .h(px(400.))
+            .w_full()
+            .gap(px(12.))
+            .p(px(16.))
+            .rounded(px(12.))
             .border_1()
             .border_color(cx.theme().border)
+            .bg(cx.tokens().surface)
             .overflow_hidden()
             .child(
                 div()
-                    .text_sm()
+                    .text_size(px(13.))
                     .text_color(cx.theme().muted_foreground)
                     .truncate()
                     .child(t!("tmpl.subject_prefix", subject = subject).to_string()),
@@ -1742,23 +2007,36 @@ impl MainWindow {
             .and_then(|n| n.to_str())
             .unwrap_or("file")
             .to_string();
-        let summary = t!(
-            "rcpt.summary",
-            file = file_name,
+        let dims = t!(
+            "rcpt.dims",
             rows = loaded.table.row_count(),
             cols = loaded.table.column_count()
         )
         .to_string();
 
         v_flex()
-            .gap_4()
+            .gap(px(24.))
             .child(
                 h_flex()
                     .items_center()
-                    .justify_between()
-                    .gap_3()
-                    .child(div().text_sm().child(summary))
-                    .child(self.choose_file_button("change-file", "rcpt.change", cx)),
+                    .gap(px(12.))
+                    .flex_wrap()
+                    .child(mono_chip(file_name, cx))
+                    .child(
+                        div()
+                            .text_size(px(13.))
+                            .text_color(cx.theme().muted_foreground)
+                            .child(dims),
+                    )
+                    .child(div().flex_1())
+                    .child(
+                        Button::new("change-file")
+                            .outline()
+                            .small()
+                            .icon(IconName::Inbox)
+                            .label(tr("rcpt.change"))
+                            .on_click(cx.listener(|this, _, _, cx| this.on_choose_file(cx))),
+                    ),
             )
             .when(loaded.sheets.len() > 1, |this| {
                 this.child(self.render_sheet_picker(loaded, cx))
@@ -1775,105 +2053,104 @@ impl MainWindow {
         for (i, name) in loaded.sheets.iter().enumerate() {
             let selected = current.as_deref() == Some(name.as_str());
             let value = name.clone();
-            chips.push(
+            chips.push(seg(
                 Button::new(SharedString::from(format!("sheet-{i}")))
                     .label(name.clone())
-                    .selected(selected)
                     .on_click(
                         cx.listener(move |this, _, _, cx| this.on_select_sheet(value.clone(), cx)),
                     ),
-            );
+                selected,
+            ));
         }
         v_flex()
-            .gap_1()
+            .gap(px(9.))
             .child(field_label("rcpt.sheet", cx))
-            .child(h_flex().gap_2().flex_wrap().children(chips))
+            .child(h_flex().gap(px(6.)).flex_wrap().children(chips))
     }
 
     fn render_email_picker(&self, loaded: &Loaded, cx: &mut Context<Self>) -> impl IntoElement {
         let email_col = loaded.email_col;
         let mut chips = Vec::new();
         for (i, header) in loaded.table.headers.iter().enumerate() {
-            chips.push(
+            chips.push(seg(
                 Button::new(SharedString::from(format!("email-col-{i}")))
                     .label(header.clone())
-                    .selected(i == email_col)
                     .on_click(cx.listener(move |this, _, _, cx| this.set_email_col(i, cx))),
-            );
+                i == email_col,
+            ));
         }
         v_flex()
-            .gap_1()
+            .gap(px(9.))
             .child(field_label("rcpt.email_col", cx))
-            .child(h_flex().gap_2().flex_wrap().children(chips))
+            .child(h_flex().gap(px(6.)).flex_wrap().children(chips))
     }
 
     fn render_mapping(&self, loaded: &Loaded, cx: &mut Context<Self>) -> AnyElement {
         if loaded.fields.is_empty() {
             return v_flex()
-                .gap_2()
+                .gap(px(9.))
                 .child(field_label("rcpt.mapping", cx))
                 .child(
                     div()
-                        .text_sm()
+                        .text_size(px(14.))
                         .text_color(cx.theme().muted_foreground)
                         .child(tr("rcpt.no_fields")),
                 )
                 .child(
                     Button::new("refresh-fields")
                         .outline()
+                        .small()
                         .label(tr("rcpt.refresh"))
                         .on_click(cx.listener(|this, _, _, cx| this.refresh_fields(cx))),
                 )
                 .into_any_element();
         }
 
-        let mut list = v_flex().gap_3().child(field_label("rcpt.mapping", cx));
+        let mut list = v_flex().gap(px(14.)).child(field_label("rcpt.mapping", cx));
         for field in &loaded.fields {
             let selected = loaded.mapping.get(field).cloned();
             let field_name = field.clone();
 
             let none_field = field_name.clone();
-            let mut chips = h_flex().gap_2().flex_wrap().child(
+            let mut chips = h_flex().gap(px(6.)).flex_wrap().child(seg(
                 Button::new(SharedString::from(format!("map-{field}-none")))
                     .label(tr("rcpt.none"))
-                    .selected(selected.is_none())
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.set_mapping(none_field.clone(), None, cx)
                     })),
-            );
+                selected.is_none(),
+            ));
             for (i, header) in loaded.table.headers.iter().enumerate() {
                 let is_selected = selected.as_deref() == Some(header.as_str());
                 let col = header.clone();
                 let field_for_col = field_name.clone();
-                chips = chips.child(
+                chips = chips.child(seg(
                     Button::new(SharedString::from(format!("map-{field}-{i}")))
                         .label(header.clone())
-                        .selected(is_selected)
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.set_mapping(field_for_col.clone(), Some(col.clone()), cx)
                         })),
-                );
+                    is_selected,
+                ));
             }
 
             list = list.child(
-                v_flex()
-                    .gap_1()
+                h_flex()
+                    .items_center()
+                    .gap(px(16.))
                     .child(
                         div()
-                            .text_sm()
+                            .w(px(92.))
+                            .flex_shrink_0()
+                            .font_family(theme::MONO_FONT)
+                            .text_size(px(13.))
                             .child(SharedString::from(format!("{{{{{field}}}}}"))),
                     )
                     .child(chips),
             );
         }
 
-        list.child(
-            Button::new("refresh-fields")
-                .ghost()
-                .label(tr("rcpt.refresh"))
-                .on_click(cx.listener(|this, _, _, cx| this.refresh_fields(cx))),
-        )
-        .into_any_element()
+        list.into_any_element()
     }
 
     fn render_validation_summary(
@@ -1882,26 +2159,50 @@ impl MainWindow {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let report = &loaded.report;
-        let theme = cx.theme();
+        let faint = cx.tokens().text_faint;
+        // Zero stats read faint; non-zero ones carry their semantic color.
+        let dim = |n: usize, color: Hsla| if n == 0 { faint } else { color };
+        let sendable = loaded.sendable();
 
-        h_flex()
+        card(cx)
+            .flex()
             .items_center()
-            .gap_5()
+            .gap(px(22.))
             .flex_wrap()
-            .child(stat("rcpt.will_send", loaded.sendable(), theme.success))
-            .child(stat("rcpt.bad_email", report.invalid_email, theme.danger))
-            .child(stat("rcpt.duplicates", report.duplicates, theme.warning))
-            .child(stat("rcpt.missing", report.missing_fields, theme.danger))
+            .px(px(18.))
+            .py(px(14.))
+            .child(stat(
+                "rcpt.will_send",
+                sendable,
+                dim(sendable, cx.theme().success),
+            ))
+            .child(stat(
+                "rcpt.bad_email",
+                report.invalid_email,
+                dim(report.invalid_email, cx.theme().danger),
+            ))
+            .child(stat(
+                "rcpt.duplicates",
+                report.duplicates,
+                dim(report.duplicates, cx.theme().warning),
+            ))
+            .child(stat(
+                "rcpt.missing",
+                report.missing_fields,
+                dim(report.missing_fields, cx.theme().danger),
+            ))
+            .child(div().flex_1())
             .child(
-                Button::new("toggle-dedupe")
-                    .outline()
-                    .selected(loaded.dedupe)
-                    .label(if loaded.dedupe {
-                        tr("rcpt.dedupe_on")
-                    } else {
-                        tr("rcpt.dedupe_off")
-                    })
-                    .on_click(cx.listener(|this, _, _, cx| this.toggle_dedupe(cx))),
+                Switch::new("dedupe-switch")
+                    .checked(loaded.dedupe)
+                    .label(tr("rcpt.dedupe"))
+                    .on_click(cx.listener(|this, _: &bool, _, cx| this.toggle_dedupe(cx))),
+            )
+            .child(
+                Button::new("refresh-fields")
+                    .link()
+                    .label(tr("rcpt.refresh"))
+                    .on_click(cx.listener(|this, _, _, cx| this.refresh_fields(cx))),
             )
     }
 
@@ -1927,21 +2228,31 @@ impl MainWindow {
             }
         }
 
+        let muted = cx.theme().muted_foreground;
+        let head = |text: String| {
+            div()
+                .flex_1()
+                .text_size(px(11.5))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(muted)
+                .truncate()
+                .child(text.to_uppercase())
+        };
         let header_row = h_flex()
             .w_full()
-            .px_2()
-            .py_1p5()
-            .gap_2()
-            .bg(cx.theme().secondary)
-            .child(div().w(px(96.)).text_xs().child(tr("rcpt.status")))
-            .children(columns.iter().map(|(name, _)| {
+            .px(px(18.))
+            .py(px(11.))
+            .gap(px(12.))
+            .bg(cx.tokens().surface_2)
+            .child(
                 div()
-                    .flex_1()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .truncate()
-                    .child(name.clone())
-            }));
+                    .w(px(110.))
+                    .text_size(px(11.5))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(muted)
+                    .child(tr("rcpt.status").to_uppercase()),
+            )
+            .children(columns.iter().map(|(name, _)| head(name.clone())));
 
         let table = loaded.table.clone();
         let report = loaded.report.clone();
@@ -1954,22 +2265,41 @@ impl MainWindow {
             for ix in range {
                 let (color, label) = status_style(&report.statuses[ix], cx);
                 let row = &table.rows[ix];
-                let cells = row_columns.iter().map(|(_, idx)| {
-                    div()
+                let cells = row_columns.iter().enumerate().map(|(ci, (_, idx))| {
+                    let cell = div()
                         .flex_1()
-                        .text_sm()
+                        .text_size(px(14.))
                         .truncate()
-                        .child(row.get(*idx).cloned().unwrap_or_default())
+                        .child(row.get(*idx).cloned().unwrap_or_default());
+                    // The first column is the email address — render it mono.
+                    if ci == 0 {
+                        cell.font_family(theme::MONO_FONT)
+                    } else {
+                        cell
+                    }
                 });
                 items.push(
                     h_flex()
                         .w_full()
-                        .px_2()
-                        .py_1()
-                        .gap_2()
-                        .border_b_1()
+                        .px(px(18.))
+                        .py(px(12.))
+                        .gap(px(12.))
+                        .border_t_1()
                         .border_color(border)
-                        .child(div().w(px(96.)).text_xs().text_color(color).child(label))
+                        .child(
+                            h_flex()
+                                .w(px(110.))
+                                .items_center()
+                                .gap(px(7.))
+                                .child(div().size(px(7.)).rounded_full().bg(color))
+                                .child(
+                                    div()
+                                        .text_size(px(12.5))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(color)
+                                        .child(label),
+                                ),
+                        )
                         .children(cells),
                 );
             }
@@ -1978,7 +2308,7 @@ impl MainWindow {
         .h(px(320.));
 
         v_flex()
-            .rounded(cx.theme().radius)
+            .rounded(px(12.))
             .border_1()
             .border_color(cx.theme().border)
             .overflow_hidden()
@@ -2318,20 +2648,20 @@ impl MainWindow {
         for account in &self.store.accounts {
             let id = account.id.clone();
             let selected = active.as_deref() == Some(id.as_str());
-            chips.push(
+            chips.push(seg(
                 Button::new(SharedString::from(format!("send-acct-{id}")))
                     .label(account.display.clone())
-                    .selected(selected)
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.selected_account = Some(id.clone());
                         cx.notify();
                     })),
-            );
+                selected,
+            ));
         }
         v_flex()
-            .gap_1()
+            .gap(px(9.))
             .child(field_label("send.account", cx))
-            .child(h_flex().gap_2().flex_wrap().children(chips))
+            .child(h_flex().gap(px(8.)).flex_wrap().children(chips))
     }
 
     fn render_preflight(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -2378,18 +2708,15 @@ impl MainWindow {
         };
 
         v_flex()
-            .gap_4()
-            .max_w(px(620.))
+            .gap(px(24.))
             .child(self.render_account_picker(cx))
             .child(self.render_resume_control(cx))
             .child(self.render_sending_settings(cx))
             .child(
-                v_flex()
-                    .gap_2()
-                    .p_4()
-                    .rounded(cx.theme().radius)
-                    .border_1()
-                    .border_color(cx.theme().border)
+                card(cx)
+                    .flex()
+                    .flex_col()
+                    .overflow_hidden()
                     .child(summary_row("send.f_account", account_label, cx))
                     .child(summary_row("send.f_subject", subject, cx))
                     .child(summary_row(
@@ -2406,7 +2733,7 @@ impl MainWindow {
             .when(!warnings.is_empty(), |this| {
                 this.child(v_flex().gap_1().children(warnings.into_iter().map(|w| {
                     div()
-                        .text_sm()
+                        .text_size(px(14.))
                         .text_color(cx.theme().warning)
                         .child(format!("⚠ {w}"))
                 })))
@@ -2417,12 +2744,18 @@ impl MainWindow {
                 } else {
                     cx.theme().danger
                 };
-                this.child(div().text_sm().text_color(color).child(notice.text))
+                this.child(
+                    div()
+                        .text_size(px(14.))
+                        .text_color(color)
+                        .child(notice.text),
+                )
             })
             .child(self.render_test_send(cx))
             .child(
                 Button::new("send-campaign")
                     .primary()
+                    .w_full()
                     .icon(IconName::ArrowRight)
                     .label(send_label)
                     .disabled(!can_send)
@@ -2506,7 +2839,7 @@ impl MainWindow {
             None => h_flex()
                 .child(
                     Button::new("resume-report")
-                        .ghost()
+                        .link()
                         .label(tr("send.resume_load"))
                         .on_click(cx.listener(|this, _, _, cx| this.on_load_resume_report(cx))),
                 )
@@ -2987,166 +3320,284 @@ impl MainWindow {
         cx.notify();
     }
 
-    fn render_topbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let dirty = self.is_dirty(cx);
-        v_flex()
-            .w_full()
-            .border_b_1()
-            .border_color(cx.theme().border)
-            .bg(cx.theme().secondary)
+    /// The accent rounded-square app mark with the white mail glyph.
+    fn app_mark(&self, size: Pixels, icon: Pixels, radius: Pixels, cx: &Context<Self>) -> Div {
+        div()
+            .flex()
+            .items_center()
+            .justify_center()
+            .size(size)
+            .flex_shrink_0()
+            .rounded(radius)
+            .bg(cx.theme().primary)
+            .text_color(cx.theme().primary_foreground)
+            .child(Icon::empty().path("icons/mail.svg").with_size(icon))
+    }
+
+    /// The custom window title bar: app mark, language dropdown, theme toggle,
+    /// file actions, and (appended by `TitleBar`) the min/max/close controls.
+    fn render_title_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        TitleBar::new()
+            .h(px(46.))
+            .child(self.app_mark_group(cx))
             .child(
                 h_flex()
-                    .w_full()
                     .items_center()
-                    .justify_between()
-                    .px_4()
-                    .py_2()
-                    .gap_3()
+                    .gap(px(6.))
+                    .pr(px(4.))
+                    .child(self.render_language_menu(cx))
+                    .child(self.render_theme_toggle(cx))
+                    .child(Divider::vertical().h(px(20.)))
+                    .child(self.render_open_menu(cx))
                     .child(
-                        h_flex()
-                            .gap_2()
-                            .items_center()
-                            .child(div().text_sm().child(self.project_name.clone()))
-                            .when(dirty, |this| {
-                                this.child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(cx.theme().warning)
-                                        .child(tr("top.unsaved")),
-                                )
-                            })
-                            .when_some(self.project_notice.clone(), |this, notice| {
-                                let color = if notice.ok {
-                                    cx.theme().muted_foreground
-                                } else {
-                                    cx.theme().danger
-                                };
-                                this.child(div().text_xs().text_color(color).child(notice.text))
-                            }),
+                        Button::new("proj-new")
+                            .small()
+                            .outline()
+                            .label(tr("top.new"))
+                            .on_click(cx.listener(|this, _, window, cx| this.on_new(window, cx))),
                     )
                     .child(
-                        h_flex()
-                            .gap_2()
-                            .items_center()
-                            .child(self.render_theme_picker(cx))
-                            .child(self.render_language_picker(cx))
-                            .child(
-                                Button::new("proj-new")
-                                    .ghost()
-                                    .label(tr("top.new"))
-                                    .on_click(
-                                        cx.listener(|this, _, window, cx| this.on_new(window, cx)),
-                                    ),
-                            )
-                            .child(
-                                Button::new("proj-open")
-                                    .ghost()
-                                    .label(tr("top.open"))
-                                    .on_click(
-                                        cx.listener(|this, _, window, cx| this.on_open(window, cx)),
-                                    ),
-                            )
-                            .child(
-                                Button::new("proj-save")
-                                    .primary()
-                                    .label(tr("top.save"))
-                                    .on_click(
-                                        cx.listener(|this, _, window, cx| this.on_save(window, cx)),
-                                    ),
-                            )
-                            .child(
-                                Button::new("proj-save-as")
-                                    .ghost()
-                                    .label(tr("top.save_as"))
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.on_save_as(window, cx)
-                                    })),
+                        Button::new("proj-save")
+                            .small()
+                            .primary()
+                            .label(tr("top.save"))
+                            .on_click(cx.listener(|this, _, window, cx| this.on_save(window, cx))),
+                    )
+                    .child(
+                        Button::new("proj-save-as")
+                            .small()
+                            .outline()
+                            .label(tr("top.save_as"))
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.on_save_as(window, cx)),
                             ),
-                    ),
+                    )
+                    .child(Divider::vertical().h(px(20.))),
             )
-            .when(!self.recents.paths.is_empty(), |this| {
-                this.child(self.render_recents_row(cx))
+    }
+
+    fn app_mark_group(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        h_flex()
+            .items_center()
+            .gap(px(9.))
+            .child(self.app_mark(px(26.), px(16.), px(7.), cx))
+            .child(
+                div()
+                    .text_size(px(13.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child("MassFckinMailer"),
+            )
+    }
+
+    /// One dropdown that lists every UI language (replaces the old inline row).
+    fn render_language_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let current = LANGUAGES
+            .iter()
+            .find(|(code, _)| *code == self.language)
+            .map(|(_, label)| *label)
+            .unwrap_or("EN");
+        let view = cx.entity();
+        let selected_code = self.language.clone();
+        Popover::new("lang-menu")
+            .anchor(Corner::TopRight)
+            .open(self.lang_menu_open)
+            .on_open_change(cx.listener(|this, open: &bool, _, cx| {
+                this.lang_menu_open = *open;
+                cx.notify();
+            }))
+            .trigger(
+                Button::new("lang-trigger")
+                    .small()
+                    .outline()
+                    .icon(IconName::Globe)
+                    .label(current.to_string()),
+            )
+            .content(move |_state, _window, _cx| {
+                let mut list = v_flex().gap(px(2.)).min_w(px(150.));
+                for (code, label) in LANGUAGES {
+                    let code = *code;
+                    let selected = selected_code == code;
+                    let view = view.clone();
+                    list = list.child(
+                        Button::new(SharedString::from(format!("lang-item-{code}")))
+                            .ghost()
+                            .w_full()
+                            .label(*label)
+                            .selected(selected)
+                            .on_click(move |_, _window, cx| {
+                                view.update(cx, |this, cx| {
+                                    this.on_set_language(code, cx);
+                                    this.lang_menu_open = false;
+                                });
+                            }),
+                    );
+                }
+                list
             })
     }
 
-    fn render_recents_row(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut chips = Vec::new();
-        for (i, entry) in self.recents.paths.iter().take(6).enumerate() {
-            let path = PathBuf::from(entry);
-            let label = base_name(&path);
-            chips.push(
-                Button::new(SharedString::from(format!("recent-{i}")))
-                    .ghost()
-                    .label(label)
-                    .tooltip(SharedString::from(entry.clone()))
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.open_recent(path.clone(), window, cx)
-                    })),
-            );
-        }
+    /// One button: moon in light mode, sun in dark; flips Light <-> Dark.
+    /// Left-click flips Light <-> Dark; right-click switches to Auto (follow OS).
+    /// The button reads `selected` while in Auto mode as a subtle hint.
+    fn render_theme_toggle(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let dark = cx.theme().is_dark();
+        let (icon, next, base_tip) = if dark {
+            (IconName::Sun, ThemePref::Light, tr("theme.light"))
+        } else {
+            (IconName::Moon, ThemePref::Dark, tr("theme.dark"))
+        };
+        let auto = self.theme_pref == ThemePref::Auto;
+        let tip = format!(
+            "{} · {}",
+            if auto { tr("theme.auto") } else { base_tip },
+            tr("theme.auto_hint")
+        );
+        div()
+            .id("theme-toggle-wrap")
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|this, _, window, cx| this.on_set_theme(ThemePref::Auto, window, cx)),
+            )
+            .child(
+                Button::new("theme-toggle")
+                    .small()
+                    .outline()
+                    .icon(icon)
+                    .tooltip(tip)
+                    .selected(auto)
+                    .on_click(
+                        cx.listener(move |this, _, window, cx| this.on_set_theme(next, window, cx)),
+                    ),
+            )
+    }
+
+    /// The `Open` button as a dropdown: "Open file…" plus recent projects.
+    fn render_open_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let view = cx.entity();
+        let recents: Vec<(String, PathBuf)> = self
+            .recents
+            .paths
+            .iter()
+            .take(6)
+            .map(|e| (base_name(&PathBuf::from(e)), PathBuf::from(e)))
+            .collect();
+        Popover::new("open-menu")
+            .anchor(Corner::TopRight)
+            .open(self.open_menu_open)
+            .on_open_change(cx.listener(|this, open: &bool, _, cx| {
+                this.open_menu_open = *open;
+                cx.notify();
+            }))
+            .trigger(
+                Button::new("proj-open")
+                    .small()
+                    .outline()
+                    .label(tr("top.open")),
+            )
+            .content(move |_state, _window, _cx| {
+                let mut list = v_flex().gap(px(2.)).min_w(px(220.));
+                let open_view = view.clone();
+                list = list.child(
+                    Button::new("open-file")
+                        .ghost()
+                        .w_full()
+                        .label(tr("top.open"))
+                        .on_click(move |_, window, cx| {
+                            open_view.update(cx, |this, cx| {
+                                this.open_menu_open = false;
+                                this.on_open(window, cx);
+                            });
+                        }),
+                );
+                if !recents.is_empty() {
+                    list = list.child(Divider::horizontal());
+                }
+                for (i, (label, path)) in recents.iter().enumerate() {
+                    let view = view.clone();
+                    let path = path.clone();
+                    list = list.child(
+                        Button::new(SharedString::from(format!("recent-{i}")))
+                            .ghost()
+                            .w_full()
+                            .label(label.clone())
+                            .on_click(move |_, window, cx| {
+                                let path = path.clone();
+                                view.update(cx, |this, cx| {
+                                    this.open_menu_open = false;
+                                    this.open_recent(path, window, cx);
+                                });
+                            }),
+                    );
+                }
+                list
+            })
+    }
+
+    /// A slim bar under the title bar: campaign name + file path (left), and a
+    /// saved-state pill (right).
+    fn render_context_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let dirty = self.is_dirty(cx);
+        let path = self
+            .project_path
+            .as_ref()
+            .map(|p| p.to_string_lossy().to_string());
+        let (dot, label) = if dirty {
+            (cx.theme().warning, tr("top.dirty"))
+        } else {
+            (cx.theme().success, tr("top.saved"))
+        };
         h_flex()
             .w_full()
             .items_center()
-            .gap_2()
-            .px_4()
-            .pb_2()
+            .gap(px(11.))
+            .h(px(40.))
+            .px(px(18.))
+            .flex_shrink_0()
+            .bg(cx.theme().title_bar)
+            .border_b_1()
+            .border_color(cx.theme().border)
             .child(
                 div()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(tr("top.recent")),
+                    .text_size(px(14.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(self.project_name.clone()),
             )
-            .children(chips)
-    }
-
-    fn render_theme_picker(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        h_flex()
-            .gap_1()
+            .when_some(path, |this, p| {
+                this.child(
+                    div()
+                        .font_family(theme::MONO_FONT)
+                        .text_size(px(11.5))
+                        .text_color(cx.tokens().text_faint)
+                        .truncate()
+                        .child(p),
+                )
+            })
+            .child(div().flex_1())
+            .when_some(self.project_notice.clone(), |this, notice| {
+                let color = if notice.ok {
+                    cx.theme().muted_foreground
+                } else {
+                    cx.theme().danger
+                };
+                this.child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(color)
+                        .child(notice.text),
+                )
+            })
             .child(
-                Button::new("theme-light")
-                    .ghost()
-                    .icon(IconName::Sun)
-                    .tooltip(tr("theme.light"))
-                    .selected(self.theme_pref == ThemePref::Light)
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.on_set_theme(ThemePref::Light, window, cx)
-                    })),
+                h_flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .child(div().size(px(7.)).rounded_full().bg(dot))
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(cx.theme().muted_foreground)
+                            .child(label),
+                    ),
             )
-            .child(
-                Button::new("theme-dark")
-                    .ghost()
-                    .icon(IconName::Moon)
-                    .tooltip(tr("theme.dark"))
-                    .selected(self.theme_pref == ThemePref::Dark)
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.on_set_theme(ThemePref::Dark, window, cx)
-                    })),
-            )
-            .child(
-                Button::new("theme-auto")
-                    .ghost()
-                    .label(tr("theme.auto"))
-                    .tooltip(tr("theme.auto_tip"))
-                    .selected(self.theme_pref == ThemePref::Auto)
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.on_set_theme(ThemePref::Auto, window, cx)
-                    })),
-            )
-    }
-
-    fn render_language_picker(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut chips = Vec::new();
-        for (code, label) in LANGUAGES {
-            let code = *code;
-            chips.push(
-                Button::new(SharedString::from(format!("lang-{code}")))
-                    .ghost()
-                    .label(*label)
-                    .selected(self.language == code)
-                    .on_click(cx.listener(move |this, _, _, cx| this.on_set_language(code, cx))),
-            );
-        }
-        h_flex().gap_1().children(chips)
     }
 }
 
@@ -3159,6 +3610,9 @@ fn apply_theme_mode(pref: ThemePref, window: &mut Window, cx: &mut App) {
         ThemePref::Auto => ThemeMode::from(window.appearance()),
     };
     Theme::change(mode, Some(window), cx);
+    // `Theme::change` re-applies its own light/dark config; layer our palette on
+    // top so every widget picks up the redesign tokens.
+    theme::apply_palette(mode, cx);
 }
 
 /// The campaign base name from a project path: strips the `.mmproj.toml`
@@ -3200,9 +3654,72 @@ fn relative_or_absolute(dir: &Path, file: &Path) -> String {
 /// A muted caption from an i18n key.
 fn field_label(key: &'static str, cx: &Context<MainWindow>) -> impl IntoElement {
     div()
-        .text_xs()
+        .text_size(px(13.))
+        .font_weight(FontWeight::MEDIUM)
         .text_color(cx.theme().muted_foreground)
         .child(tr(key))
+}
+
+/// A card surface: surface fill, hairline border, large radius, soft shadow.
+fn card(cx: &Context<MainWindow>) -> Div {
+    div()
+        .bg(cx.tokens().surface)
+        .border_1()
+        .border_color(cx.theme().border)
+        .rounded(px(14.))
+        .shadow(cx.tokens().card_shadow())
+}
+
+/// A rounded `surface_2` pill rendering a technical string (filename, token).
+fn mono_chip(text: impl Into<SharedString>, cx: &Context<MainWindow>) -> Div {
+    div()
+        .px(px(11.))
+        .py(px(6.))
+        .rounded(px(8.))
+        .bg(cx.tokens().surface_2)
+        .border_1()
+        .border_color(cx.theme().border)
+        .font_family(theme::MONO_FONT)
+        .text_size(px(13.))
+        .child(text.into())
+}
+
+/// Style a button as one option of a segmented control: selected = filled
+/// accent, unselected = muted `surface_2`.
+fn seg(button: Button, selected: bool) -> Button {
+    let button = button.small();
+    // Unselected keeps the default `Secondary` variant (muted `surface_2`).
+    if selected { button.primary() } else { button }
+}
+
+/// A 34px bordered icon button (custom SVG). `danger` turns it red on hover.
+/// The caller attaches `.on_click(...)`.
+fn icon_btn(
+    id: impl Into<ElementId>,
+    icon_path: &'static str,
+    danger: bool,
+    cx: &Context<MainWindow>,
+) -> Stateful<Div> {
+    let hover_fg = if danger {
+        cx.theme().danger
+    } else {
+        cx.theme().foreground
+    };
+    let hover_bg = cx.tokens().surface_2;
+    div()
+        .id(id.into())
+        .flex()
+        .items_center()
+        .justify_center()
+        .size(px(34.))
+        .flex_shrink_0()
+        .rounded(px(8.))
+        .border_1()
+        .border_color(cx.theme().border)
+        .text_color(cx.theme().muted_foreground)
+        .cursor_pointer()
+        .hover(move |h| h.bg(hover_bg).text_color(hover_fg).border_color(hover_fg))
+        .child(Icon::empty().path(icon_path).with_size(px(16.)))
 }
 
 /// A labelled text field; `label_key` is an i18n key.
@@ -3217,13 +3734,19 @@ fn labeled(
         .child(Input::new(input))
 }
 
-/// A small "label: N" statistic with a coloured count; `label_key` is i18n.
+/// A statistic: a big coloured count over/with a muted label; `label_key` is i18n.
 fn stat(label_key: &'static str, value: usize, color: Hsla) -> impl IntoElement {
     h_flex()
-        .gap_1p5()
+        .gap(px(6.))
         .items_baseline()
-        .child(div().text_lg().text_color(color).child(value.to_string()))
-        .child(div().text_xs().child(tr(label_key)))
+        .child(
+            div()
+                .text_size(px(18.))
+                .font_weight(FontWeight::BOLD)
+                .text_color(color)
+                .child(value.to_string()),
+        )
+        .child(div().text_size(px(13.)).child(tr(label_key)))
 }
 
 fn status_style(status: &RowStatus, cx: &App) -> (Hsla, SharedString) {
@@ -3245,23 +3768,35 @@ fn outcome_style(status: &OutcomeStatus, cx: &App) -> (Hsla, SharedString) {
     }
 }
 
-/// A "Label   value" line for the pre-flight summary card; `label_key` is i18n.
+/// A "Label … value" line for the pre-flight summary card (value in mono, right
+/// aligned, with a hairline divider); `label_key` is i18n.
 fn summary_row(
     label_key: &'static str,
     value: String,
     cx: &Context<MainWindow>,
 ) -> impl IntoElement {
     h_flex()
-        .gap_3()
-        .items_baseline()
+        .items_center()
+        .gap(px(12.))
+        .px(px(20.))
+        .py(px(14.))
+        .border_b_1()
+        .border_color(cx.theme().border)
         .child(
             div()
-                .w(px(110.))
-                .text_xs()
+                .flex_1()
+                .text_size(px(13.))
                 .text_color(cx.theme().muted_foreground)
                 .child(tr(label_key)),
         )
-        .child(div().flex_1().text_sm().truncate().child(value))
+        .child(
+            div()
+                .font_family(theme::MONO_FONT)
+                .text_size(px(14.))
+                .max_w(px(380.))
+                .truncate()
+                .child(value),
+        )
 }
 
 /// Human-readable duration like "45s", "3m 20s", "1h 5m".
@@ -3282,14 +3817,16 @@ fn kind_button(
     current: ProviderKind,
     cx: &mut Context<MainWindow>,
 ) -> Button {
-    Button::new(id)
-        .label(tr(label_key))
-        .selected(value == current)
-        .on_click(cx.listener(move |this, _, _, cx| {
-            this.form.kind = value;
-            this.notice = None;
-            cx.notify();
-        }))
+    seg(
+        Button::new(id)
+            .label(tr(label_key))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.form.kind = value;
+                this.notice = None;
+                cx.notify();
+            })),
+        value == current,
+    )
 }
 
 fn tls_button(
@@ -3299,13 +3836,15 @@ fn tls_button(
     current: TlsMode,
     cx: &mut Context<MainWindow>,
 ) -> Button {
-    Button::new(id)
-        .label(tr(label_key))
-        .selected(value == current)
-        .on_click(cx.listener(move |this, _, _, cx| {
-            this.form.tls = value;
-            cx.notify();
-        }))
+    seg(
+        Button::new(id)
+            .label(tr(label_key))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.form.tls = value;
+                cx.notify();
+            })),
+        value == current,
+    )
 }
 
 fn region_button(
@@ -3315,13 +3854,15 @@ fn region_button(
     current: MailgunRegion,
     cx: &mut Context<MainWindow>,
 ) -> Button {
-    Button::new(id)
-        .label(tr(label_key))
-        .selected(value == current)
-        .on_click(cx.listener(move |this, _, _, cx| {
-            this.form.region = value;
-            cx.notify();
-        }))
+    seg(
+        Button::new(id)
+            .label(tr(label_key))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.form.region = value;
+                cx.notify();
+            })),
+        value == current,
+    )
 }
 
 impl Render for MainWindow {
@@ -3330,7 +3871,8 @@ impl Render for MainWindow {
             .size_full()
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
-            .child(self.render_topbar(cx))
+            .child(self.render_title_bar(cx))
+            .child(self.render_context_bar(cx))
             .child(
                 h_flex()
                     .flex_1()
