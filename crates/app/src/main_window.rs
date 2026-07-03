@@ -1025,7 +1025,12 @@ impl MainWindow {
                         let col = table
                             .column_index(email_column)
                             .unwrap_or_else(|| import::detect_email_column_in(&table).unwrap_or(0));
-                        (col, mapping.clone())
+                        // The saved mapping wins, but auto-map any template field it
+                        // doesn't already cover — e.g. projects saved before a
+                        // placeholder existed, whose mapping is empty or stale.
+                        let mut merged = mapping::auto_map(&fields, &table.headers);
+                        merged.extend(mapping.iter().map(|(f, c)| (f.clone(), c.clone())));
+                        (col, merged)
                     }
                     None => (
                         import::detect_email_column_in(&table).unwrap_or(0),

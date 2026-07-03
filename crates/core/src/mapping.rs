@@ -243,4 +243,25 @@ mod tests {
         let report = validate(&t, 0, &[]);
         assert_eq!(report.valid, 2);
     }
+
+    /// Loading a project with an empty saved mapping should still resolve
+    /// placeholders whose names match columns: the app merges `auto_map` under
+    /// the saved mapping, so the preview fills in. (Mirrors `on_parsed`.)
+    #[test]
+    fn empty_saved_mapping_is_backfilled_by_auto_map() {
+        let fields = vec!["name".to_string(), "email".to_string()];
+        let t = table(
+            &["email", "Name"],
+            &[&["emre@besirik.com", "Emre At Besirik"]],
+        );
+        let saved: BTreeMap<String, String> = BTreeMap::new();
+
+        // What `on_parsed` now does for a loaded project: auto-map, saved wins.
+        let mut merged = auto_map(&fields, &t.headers);
+        merged.extend(saved);
+
+        let context = build_context(&t, &t.rows[0], &merged);
+        assert_eq!(context.get("name"), Some(&"Emre At Besirik".to_string()));
+        assert_eq!(context.get("email"), Some(&"emre@besirik.com".to_string()));
+    }
 }
